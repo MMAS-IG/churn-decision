@@ -42,8 +42,12 @@ vignettes/*.pdf
 # pkgdown site
 docs/
 
-# translation temp files
-po/*~
+# Quarto / knit artefacts
+.quarto/
+*_files/
+*.html
+figures/*.png
+
 
 # RStudio Connect folder
 rsconnect/

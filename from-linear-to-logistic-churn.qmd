@@ -1,0 +1,788 @@
+---
+title: "From a linear probability model to logistic regression"
+subtitle: "Predicting customer churn with the IBM Telco data"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    theme: cosmo
+    html-math-method: katex
+    fig-width: 7.5
+    fig-height: 4.6
+    fig-dpi: 120
+knitr:
+  opts_chunk:
+    comment: "#>"
+    message: false
+    warning: false
+    fig.path: "figures/"
+execute:
+  echo: true
+---
+
+```{r}
+#| label: setup
+library(here)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(scales)
+library(broom)
+library(car)
+library(lmtest)
+library(pROC)
+
+theme_set(theme_minimal(base_size = 12))
+dir.create(here("figures"), showWarnings = FALSE)
+```
+
+The same analysis lives as scripts under `R/` (`source("R/00_run_all.R")` from the project root). Estimation uses only `stats::lm` and `stats::glm`; the packages above are for wrangling, plots, coefficient tables, VIF, a heteroskedasticity test, and ROC curves.
+
+# The Telco churn data
+
+The file [`data/WA_Fn-UseC_-Telco-Customer-Churn.csv`](data/WA_Fn-UseC_-Telco-Customer-Churn.csv) is the IBM sample **Telco Customer Churn** table, also hosted on Kaggle as [blastchar/telco-customer-churn](https://www.kaggle.com/datasets/blastchar/telco-customer-churn). There are $7{,}043$ rows (one customer) and $21$ columns. The last column, `Churn`, records whether the customer left during the most recent month.
+
+Kaggle's own framing is retention: use the account, service, and demographic fields to predict who leaves, then target offers. IBM's [2019 note on the same sample](https://community.ibm.com/community/user/businessanalytics/blogs/steven-macko/2019/07/11/telco-customer-churn-1113) is a second description of the columns.
+
+## Why a probability, not only a yes/no flag
+
+Acquisition is expensive. A customer who leaves takes remaining lifetime revenue. A model of
+$$
+p(\mathbf{x}) = P(\text{churn}=1 \mid \text{account and services } \mathbf{x})
+$$
+is useful for three operational tasks that a hard $0/1$ label does not cover on its own:
+
+- **Ranking.** Sort the base by risk and spend the retention budget on the top of the list.
+- **Pricing the intervention.** Compare the cost of an offer with $p(\mathbf{x})$ times lost margin. That comparison needs a number in $[0,1]$, not a negative OLS fit.
+- **Partial association.** See which contract and service features move $p(\mathbf{x})$ when the rest of the profile is held fixed.
+
+The modelling rule in this document is blunt: **use every column except `customerID`**. No variable selection, no penalisation, no trees. The point is to see what ordinary linear regression does to a binary outcome, why that is the wrong mean function, and what a standard logistic regression puts in its place.
+
+## Column metadata
+
+The Kaggle page lists the same fields. In the raw CSV they are:
+
+| Column | Type in the file | Meaning |
+| --- | --- | --- |
+| `customerID` | identifier | Dropped. Not a predictor. |
+| `gender` | `Female` / `Male` | Sex of the account holder. |
+| `SeniorCitizen` | $0/1$ | Whether the customer is a senior (recoded to a factor below). |
+| `Partner` | `Yes` / `No` | Household partner. |
+| `Dependents` | `Yes` / `No` | Dependents in the household. |
+| `tenure` | integer, months | Time already spent with the firm ($0$ to $72$). |
+| `PhoneService` | `Yes` / `No` | Landline / mobile voice. |
+| `MultipleLines` | `Yes` / `No` / `No phone service` | Extra lines; the third label repeats `PhoneService`. |
+| `InternetService` | `DSL` / `Fiber optic` / `No` | Access technology. |
+| `OnlineSecurity`, `OnlineBackup`, `DeviceProtection`, `TechSupport`, `StreamingTV`, `StreamingMovies` | `Yes` / `No` / `No internet service` | Add-ons; the third label repeats `InternetService`. |
+| `Contract` | `Month-to-month` / `One year` / `Two year` | Commitment. |
+| `PaperlessBilling` | `Yes` / `No` | Electronic bill. |
+| `PaymentMethod` | four labels | Bank transfer, credit card, electronic cheque, mailed cheque. |
+| `MonthlyCharges` | numeric | Current monthly bill. |
+| `TotalCharges` | numeric (blank if `tenure = 0`) | Cumulative bill. |
+| `Churn` | `Yes` / `No` | Left in the last month. Recoded to $1/0$. |
+
+`MonthlyCharges` is close to an accounting identity in the service dummies (fibre, streaming, add-ons). `TotalCharges` tracks `tenure` times a typical monthly bill. Keeping **all** of them is the requested first specification; it also means fibre and price should not be read as two independent causal knobs.
+
+## Load, recode nested labels, split
+
+`TotalCharges` is missing for eleven customers with `tenure = 0` (no bill yet). Those values are set to $0$.
+
+Left as is, `"No phone service"` and `"No internet service"` are linearly dependent on `PhoneService` and `InternetService`, and `lm()` / `glm()` drop coefficients. The columns are kept; the redundant labels are recoded to `"No"`.
+
+Factors use treatment contrasts. Reference levels are chosen so that coefficients later have a readable baseline: female, DSL, month-to-month, bank transfer.
+
+A $70/30$ train/test split (`set.seed(2026)`) is stored once and reused for every later plot. Coefficients are estimated on the training rows; probability scores are judged on the test rows.
+
+The same preparation is in `R/01_prepare_data.R`.
+
+```{r}
+#| label: prepare
+data_path <- here("data", "WA_Fn-UseC_-Telco-Customer-Churn.csv")
+telco_raw <- read.csv(
+  data_path,
+  stringsAsFactors = FALSE,
+  na.strings = c("", " ", "NA")
+)
+
+n_blank_total <- sum(is.na(telco_raw$TotalCharges))
+telco_raw$TotalCharges[is.na(telco_raw$TotalCharges)] <- 0
+
+phone_addon <- "MultipleLines"
+internet_addons <- c(
+  "OnlineSecurity", "OnlineBackup", "DeviceProtection",
+  "TechSupport", "StreamingTV", "StreamingMovies"
+)
+telco_raw[[phone_addon]] <- ifelse(
+  telco_raw[[phone_addon]] == "No phone service", "No", telco_raw[[phone_addon]]
+)
+for (v in internet_addons) {
+  telco_raw[[v]] <- ifelse(telco_raw[[v]] == "No internet service", "No", telco_raw[[v]])
+}
+
+telco <- telco_raw %>%
+  mutate(
+    Churn = as.integer(Churn == "Yes"),
+    SeniorCitizen = factor(SeniorCitizen, levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  mutate(across(where(is.character), factor)) %>%
+  select(-customerID)
+
+telco$Contract <- relevel(telco$Contract, ref = "Month-to-month")
+telco$InternetService <- relevel(telco$InternetService, ref = "DSL")
+telco$PaymentMethod <- relevel(telco$PaymentMethod, ref = "Bank transfer (automatic)")
+telco$gender <- relevel(telco$gender, ref = "Female")
+
+set.seed(2026)
+n <- nrow(telco)
+test_id <- sample(seq_len(n), size = floor(0.30 * n))
+telco_train <- telco[-test_id, , drop = FALSE]
+telco_test <- telco[test_id, , drop = FALSE]
+churn_formula <- Churn ~ .
+```
+
+```{r}
+#| label: glance
+c(
+  n = nrow(telco),
+  n_train = nrow(telco_train),
+  n_test = nrow(telco_test),
+  n_blank_total = n_blank_total,
+  n_predictors = ncol(telco) - 1L
+)
+glimpse(telco)
+```
+
+`Churn ~ .` is every remaining column on the right-hand side: demographics, tenure, all services, contract, billing, monthly and total charges.
+
+## What the raw association looks like
+
+Overall churn is about one customer in four. That imbalance already warns against treating accuracy at a $0.5$ cut as the headline number: always predicting “stay” is already correct for roughly three quarters of the rows.
+
+```{r}
+#| label: explore-tables
+churn_rate <- mean(telco$Churn)
+print(table(Churn = factor(telco$Churn, labels = c("No", "Yes"))))
+print(round(prop.table(table(Churn = factor(telco$Churn, labels = c("No", "Yes")))), 3))
+
+telco %>%
+  group_by(Contract) %>%
+  summarise(n = n(), churn_rate = mean(Churn), .groups = "drop")
+
+telco %>%
+  group_by(InternetService) %>%
+  summarise(n = n(), churn_rate = mean(Churn), .groups = "drop")
+
+telco %>%
+  group_by(PaymentMethod) %>%
+  summarise(n = n(), churn_rate = mean(Churn), .groups = "drop")
+```
+
+```{r}
+#| label: explore-plots
+#| fig-cap: "Stacked shares of churn by contract type."
+ggplot(telco, aes(x = Contract, fill = factor(Churn, labels = c("No", "Yes")))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("#2c7bb6", "#d7191c"), name = "Churn") +
+  labs(x = "Contract", y = "Share of customers", title = "Churn mix by contract type")
+```
+
+```{r}
+#| label: explore-tenure
+#| fig-cap: "Tenure is shifted left among customers who churn."
+ggplot(telco, aes(x = tenure, fill = factor(Churn, labels = c("No", "Yes")))) +
+  geom_histogram(binwidth = 3, position = "identity", alpha = 0.55) +
+  scale_fill_manual(values = c("#2c7bb6", "#d7191c"), name = "Churn") +
+  labs(x = "Tenure (months)", y = "Customers", title = "Tenure distribution by churn")
+```
+
+```{r}
+#| label: explore-charges
+#| fig-cap: "Monthly charges among churners sit higher than among stayers."
+ggplot(telco, aes(x = MonthlyCharges, fill = factor(Churn, labels = c("No", "Yes")))) +
+  geom_density(alpha = 0.45) +
+  scale_fill_manual(values = c("#2c7bb6", "#d7191c"), name = "Churn") +
+  labs(x = "Monthly charges", y = "Density", title = "Monthly charges by churn")
+```
+
+Month-to-month contracts, fibre, and electronic cheque are the high-churn cells. Long tenure is the low-churn region. Those patterns already suggest that a *probability* should flatten as tenure becomes very large or very small, rather than keep moving on a straight line.
+
+The same univariate views are in `R/02_explore.R`.
+
+# Why OLS is the wrong first model for churn
+
+Write $Y_i=1$ if customer $i$ churns and $Y_i=0$ otherwise. A multiple linear regression
+$$
+Y_i = \mathbf{x}_i^\top\boldsymbol{\beta} + \varepsilon_i
+$$
+is the **linear probability model** (LPM). Taking expectations,
+$$
+\mathbb{E}[Y_i\mid \mathbf{x}_i] = P(Y_i=1\mid \mathbf{x}_i) = \mathbf{x}_i^\top\boldsymbol{\beta}.
+$$
+The left-hand side is a probability, hence in $[0,1]$. The right-hand side is an unconstrained linear index. That single mismatch generates the rest of the pathology.
+
+## What the Gauss–Markov story assumed
+
+Ordinary least squares is built for a continuous response where, at least approximately,
+
+1. $\mathbb{E}[\varepsilon_i\mid \mathbf{x}_i]=0$ and the mean is linear in $\mathbf{x}_i$,
+2. $\mathrm{Var}(\varepsilon_i\mid \mathbf{x}_i)=\sigma^2$ (homoskedasticity),
+3. the errors are not confined to two points, so a Gaussian approximation for tests is plausible in moderate samples.
+
+For Bernoulli $Y_i$ with success probability $p_i=\mathbf{x}_i^\top\boldsymbol{\beta}$,
+$$
+\mathrm{Var}(Y_i\mid \mathbf{x}_i) = p_i(1-p_i) = (\mathbf{x}_i^\top\boldsymbol{\beta})\bigl(1-\mathbf{x}_i^\top\boldsymbol{\beta}\bigr),
+$$
+which *depends on* $\mathbf{x}_i$ as soon as $p_i$ is not constant. Residuals equal $1-\hat p_i$ or $-\hat p_i$, so they cannot look like Gaussian noise. Fitted values need not lie in $[0,1]$.
+
+A coefficient in the LPM still has a blunt reading: $\beta_j$ is the change in $P(Y=1)$ associated with a one-unit change in $x_j$, holding the other covariates fixed. That reading is useful *locally*, near the centre of the data. It is not a reason to treat the LPM as a probability model.
+
+## Dummy variables (same coding in `lm` and `glm`)
+
+A factor with $K$ levels becomes $K-1$ dummies under treatment contrasts. For `Contract`, month-to-month is the omitted level, so `ContractOne year` is the difference in the linear index between a one-year contract and a month-to-month contract, **holding tenure, services, and charges fixed**. The same contrast will appear later on the log-odds scale.
+
+```{r}
+#| label: lpm-fit
+lpm <- lm(churn_formula, data = telco_train)
+summary(lpm)
+alias(lpm)$Complete
+vif(lpm)
+```
+
+The same LPM fit is in `R/03_linear_probability.R`.
+
+```{r}
+#| label: lpm-problems
+lpm_train_fit <- fitted(lpm)
+c(
+  n_outside_01 = sum(lpm_train_fit < 0 | lpm_train_fit > 1),
+  share_outside = mean(lpm_train_fit < 0 | lpm_train_fit > 1),
+  min_fit = min(lpm_train_fit),
+  max_fit = max(lpm_train_fit)
+)
+bptest(lpm)
+```
+
+```{r}
+#| label: lpm-hist
+#| fig-cap: "OLS fitted values spill below 0 and above 1."
+ggplot(data.frame(fit = lpm_train_fit), aes(x = fit)) +
+  geom_histogram(bins = 40, fill = "#7b3294", colour = "white") +
+  geom_vline(xintercept = c(0, 1), linetype = "dashed", colour = "grey20") +
+  labs(
+    x = "Fitted value (OLS)",
+    y = "Customers (training set)",
+    title = "Linear probability model: fitted values are not probabilities"
+  )
+```
+
+```{r}
+#| label: lpm-resid
+#| fig-cap: "Residuals of a 0/1 regression form two bands, not a Gaussian cloud."
+ggplot(data.frame(fitted = lpm_train_fit, resid = resid(lpm)), aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.15, colour = "#7b3294") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Fitted value",
+    y = "Residual",
+    title = "LPM residuals: two bands (Y = 0 and Y = 1), not Gaussian noise"
+  )
+```
+
+```{r}
+#| label: lpm-tenure
+#| fig-cap: "A straight line through 0/1 tenure points crosses the probability bounds."
+lpm_tenure <- lm(Churn ~ tenure, data = telco_train)
+tenure_grid <- data.frame(tenure = seq(0, 72, by = 1))
+tenure_grid$lpm <- predict(lpm_tenure, newdata = tenure_grid)
+ggplot(telco_train, aes(x = tenure, y = Churn)) +
+  geom_jitter(height = 0.04, alpha = 0.08, colour = "grey30") +
+  geom_line(data = tenure_grid, aes(x = tenure, y = lpm), colour = "#7b3294", linewidth = 1) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted") +
+  labs(
+    x = "Tenure (months)",
+    y = "Churn (0/1)",
+    title = "OLS on a binary outcome can leave the [0, 1] interval"
+  )
+```
+
+```{r}
+#| label: lpm-tidy
+tidy(lpm, conf.int = TRUE)
+```
+
+## Reading the LPM output
+
+On the training sample ($n=`r nrow(telco_train)`$):
+
+- About **`r round(100 * mean(fitted(lpm) < 0 | fitted(lpm) > 1), 1)`%** of fitted values fall outside $[0,1]$ (range about `r round(min(fitted(lpm)), 2)` to `r round(max(fitted(lpm)), 2)`). Those numbers are not probabilities. A retention budget cannot treat $\hat y=-0.2$ as “a 20% chance of staying twice”.
+- The Breusch–Pagan test rejects homoskedasticity, as the Bernoulli variance formula already predicted. Classical OLS standard errors are therefore the wrong ones in finite samples; even with robust standard errors, the mean function remains linear and unbounded.
+- Residual versus fitted is two clouds, one for $Y=0$ and one for $Y=1$, not a band of mean-zero noise.
+- $R^2\approx`r round(summary(lpm)$r.squared, 3)`$ is the usual OLS share of variance. It is not a natural score for a binary decision, and it can look “reasonable” while $\hat y$ is still negative.
+
+Two coefficients that *are* readable, because the corresponding variables are not swallowed by the bill:
+
+- **One-year vs month-to-month contract:** about `r round(100 * coef(lpm)["ContractOne year"], 1)` percentage points on the probability scale.
+- **Tenure:** about `r round(1000 * coef(lpm)["tenure"], 2)` thousandths of a probability per extra month, or roughly `r round(12 * 100 * coef(lpm)["tenure"], 1)` points per extra year of tenure, as a linear approximation.
+
+`MonthlyCharges` has a huge generalised VIF because the monthly bill is almost an accounting identity in the service dummies. The model still *uses* those columns; the fibre and price coefficients should not be read as separate causal knobs. Contract, tenure, paperless billing, and payment method are the safer partial associations.
+
+The univariate plot of churn against tenure makes the geometric point without any of that complexity: a straight line fitted to $0/1$ dots **crosses $0$** at long tenure. The mean function is wrong in the tails even if it is acceptable in the middle.
+
+# Logistic regression
+
+Keep the same linear index $\eta_i=\mathbf{x}_i^\top\boldsymbol{\beta}$, but send it through a map that lands in $(0,1)$:
+$$
+p_i = P(Y_i=1\mid \mathbf{x}_i) = \frac{e^{\eta_i}}{1+e^{\eta_i}} = \mathrm{logit}^{-1}(\eta_i),
+$$
+equivalently
+$$
+\mathrm{logit}(p_i) = \log\frac{p_i}{1-p_i} = \mathbf{x}_i^\top\boldsymbol{\beta}.
+$$
+The logit is the log odds. Odds are $p/(1-p)$: if $p=0.25$, the odds of churn are $1:3$. Logistic regression is linear in that log-odds, not in $p$ itself.
+
+Maximum likelihood for independent Bernoulli trials is
+$$
+\ell(\boldsymbol{\beta}) = \sum_{i=1}^n \Bigl\{ y_i\log p_i(\boldsymbol{\beta}) + (1-y_i)\log\bigl(1-p_i(\boldsymbol{\beta})\bigr) \Bigr\}.
+$$
+In R this is `glm(..., family = binomial(link = "logit"))`. No extra package is required for the fit.
+
+The sigmoid $e^\eta/(1+e^\eta)$ is almost linear near $p=1/2$ and flattens toward $0$ and $1$. That is why logistic curves and LPM lines can look similar in the bulk of the sample and disagree for very loyal or very new customers.
+
+The same GLM is in `R/04_logistic_regression.R`.
+
+```{r}
+#| label: logit-fit
+logit_mod <- glm(churn_formula, data = telco_train, family = binomial(link = "logit"))
+summary(logit_mod)
+
+logit_null <- glm(Churn ~ 1, data = telco_train, family = binomial)
+anova(logit_null, logit_mod, test = "Chisq")
+```
+
+```{r}
+#| label: logit-or-table
+logit_or <- tidy(logit_mod, conf.int = TRUE, exponentiate = TRUE)
+logit_or
+
+mcfadden <- 1 - as.numeric(logLik(logit_mod)) / as.numeric(logLik(logit_null))
+c(mcfadden = mcfadden, AIC_logit = AIC(logit_mod), AIC_lpm_not_comparable = AIC(lpm))
+```
+
+```{r}
+#| label: logit-hist
+#| fig-cap: "Logistic fitted values remain inside (0, 1)."
+logit_train_p <- fitted(logit_mod)
+range(logit_train_p)
+
+ggplot(data.frame(fit = logit_train_p), aes(x = fit)) +
+  geom_histogram(bins = 40, fill = "#018571", colour = "white") +
+  geom_vline(xintercept = c(0, 1), linetype = "dashed", colour = "grey20") +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(
+    x = "Fitted P(churn = 1)",
+    y = "Customers (training set)",
+    title = "Logistic fitted values stay inside (0, 1)"
+  )
+```
+
+```{r}
+#| label: logit-vs-lpm-tenure
+#| fig-cap: "Tenure only: the logistic mean flattens; the LPM line does not."
+logit_tenure <- glm(Churn ~ tenure, data = telco_train, family = binomial)
+tenure_grid <- data.frame(tenure = seq(0, 72, by = 1))
+tenure_grid$lpm <- predict(lm(Churn ~ tenure, data = telco_train), newdata = tenure_grid)
+tenure_grid$logit <- predict(logit_tenure, newdata = tenure_grid, type = "response")
+tenure_long <- pivot_longer(tenure_grid, cols = c("lpm", "logit"), names_to = "model", values_to = "pred")
+tenure_long$model <- ifelse(tenure_long$model == "lpm", "Linear probability", "Logistic")
+
+ggplot() +
+  geom_jitter(
+    data = telco_train, aes(x = tenure, y = Churn),
+    height = 0.04, alpha = 0.06, colour = "grey30"
+  ) +
+  geom_line(data = tenure_long, aes(x = tenure, y = pred, colour = model), linewidth = 1) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted") +
+  scale_colour_manual(values = c("Linear probability" = "#7b3294", "Logistic" = "#018571")) +
+  labs(
+    x = "Tenure (months)",
+    y = "P(churn) / churn indicator",
+    colour = NULL,
+    title = "Same predictor, two mean functions"
+  )
+```
+
+## How to read `summary(glm)`
+
+The printed block is close to `summary(lm)`, with three systematic differences.
+
+**Coefficients.** The `Estimate` column is $\hat\beta_j$ on the **log-odds** scale, not on the probability scale. `Std. Error` is the square root of the corresponding diagonal of the inverse Fisher information (the usual GLM sandwich at the MLE). The ratio is a Wald $z$ statistic, not a $t$ statistic: the extra Gaussian scale $\sigma$ of linear regression is gone, because the Bernoulli variance is a function of $p_i$. `Pr(>|z|)` is the two-sided Wald $p$-value.
+
+**Intercept.** With treatment contrasts, the intercept is the log-odds of churn for the reference customer: female, not senior, no partner, no dependents, DSL, month-to-month, bank transfer, and all the `"No"` service levels, at tenure $0$ and zero charges. That is a corner of the design, not a typical account. Do not interpret the intercept in isolation.
+
+**Null and residual deviance.** For a nested Bernoulli model, the residual deviance is $D=-2(\ell_{\text{model}}-\ell_{\text{saturated}})$. The null deviance is the same quantity for the intercept-only model. The difference,
+$$
+D_{\text{null}}-D_{\text{model}} = 2(\ell_{\text{model}}-\ell_{\text{null}}),
+$$
+is a likelihood-ratio statistic, compared to a $\chi^2$ with degrees of freedom equal to the number of added parameters. Here that test is overwhelming: the covariates jointly move the log-likelihood. A large residual deviance relative to residual degrees of freedom is *not* automatic evidence of a bad mean (Bernoulli data are not Gaussian); it is a reminder to look at calibration and binned residuals instead.
+
+**AIC.** AIC $= -2\ell + 2k$ is a penalised in-sample fit. It is **not** comparable between `lm` (Gaussian) and `glm` (binomial), because the two likelihoods are different families. The LPM AIC is printed only as a warning.
+
+**McFadden's pseudo-$R^2$**,
+$$
+R^2_{\text{McF}} = 1-\frac{\ell_{\text{model}}}{\ell_{\text{null}}},
+$$
+is a relative gain in log-likelihood, not a share of variance. Values around $0.2$–$0.4$ are already large for a binary household or telecom outcome. The training figure here is `r round(1 - as.numeric(logLik(logit_mod))/as.numeric(logLik(logit_null)), 3)`.
+
+**Fisher scoring iterations.** Logistic likelihoods for these data are regular; a handful of iterations to convergence is the expected behaviour.
+
+## Odds ratios
+
+Exponentiate a coefficient:
+$$
+e^{\beta_j} = \frac{\text{odds}(x_j+1)}{\text{odds}(x_j)},
+$$
+holding the other covariates fixed. An odds ratio of $0.94$ is *not* a $6\%$ drop in the churn probability.
+
+Selected training-set odds ratios (profile-likelihood $95\%$ intervals from `broom::tidy(..., exponentiate = TRUE)`):
+
+- **Tenure (one extra month):** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["tenure"]), 3)`$. Twelve extra months compound as $e^{12\hat\beta}\approx`r round(exp(12 * coef(logit_mod)["tenure"]), 3)`$ on the odds scale, still holding contract, services, and charges fixed.
+- **One-year contract vs month-to-month:** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["ContractOne year"]), 3)`$.
+- **Two-year contract vs month-to-month:** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["ContractTwo year"]), 3)`$.
+- **Paperless billing:** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["PaperlessBillingYes"]), 3)`$.
+- **Electronic cheque vs bank transfer:** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["PaymentMethodElectronic check"]), 3)`$.
+- **Online security (Yes vs No):** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["OnlineSecurityYes"]), 3)`$.
+- **Tech support (Yes vs No):** $e^{\hat\beta}\approx`r round(exp(coef(logit_mod)["TechSupportYes"]), 3)`$.
+
+These are partial associations. A two-year contract is chosen by customers who already intend to stay; the coefficient mixes the legal lock-in with that selection. The same caveat applies to electronic cheque (often the default for customers who never set up an automatic transfer).
+
+Fibre versus DSL has a large point estimate and a very wide interval. That is the VIF story again: fibre and `MonthlyCharges` move together. Report the contract and tenure odds ratios; treat the fibre/price pair as a bundle.
+
+```{r}
+#| label: odds-plot
+#| fig-cap: "Selected odds ratios with 95% intervals (log scale)."
+or_focus <- c(
+  "tenure", "SeniorCitizenYes", "ContractOne year", "ContractTwo year",
+  "InternetServiceFiber optic", "InternetServiceNo", "PaperlessBillingYes",
+  "PaymentMethodElectronic check", "OnlineSecurityYes", "TechSupportYes"
+)
+or_plot_df <- logit_or %>%
+  dplyr::filter(term %in% or_focus) %>%
+  mutate(term = factor(term, levels = rev(or_focus)))
+ggplot(or_plot_df, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), orientation = "y", width = 0.2, colour = "#018571") +
+  geom_point(size = 2.4, colour = "#018571") +
+  scale_x_log10() +
+  labs(
+    x = "Odds ratio (log scale) with 95% CI",
+    y = NULL,
+    title = "Selected logistic odds ratios (training set)"
+  )
+```
+
+## From log-odds back to a probability
+
+For a concrete profile $\mathbf{x}_0$,
+$$
+\hat p(\mathbf{x}_0) = \frac{\exp(\mathbf{x}_0^\top\hat{\boldsymbol{\beta}})}{1+\exp(\mathbf{x}_0^\top\hat{\boldsymbol{\beta}})}.
+$$
+In R: `predict(logit_mod, newdata = x0, type = "response")`. The default `type = "link"` returns $\mathbf{x}_0^\top\hat{\boldsymbol{\beta}}$ on the logit scale.
+
+A one-unit shift in $x_j$ changes the *probability* by an amount that depends on where one starts:
+$$
+\frac{\partial p}{\partial x_j} = \beta_j\, p(1-p).
+$$
+The effect is largest near $p=1/2$ and shrinks in the tails. Averaging that slope over the training sample gives an **average partial effect** $\hat\beta_j\,\overline{\hat p(1-\hat p)}$, which is the logistic quantity most directly comparable to an LPM coefficient.
+
+```{r}
+#| label: ape
+ape_scale <- mean(fitted(logit_mod) * (1 - fitted(logit_mod)))
+common_terms <- intersect(names(coef(lpm)), names(coef(logit_mod)))
+ape_cmp <- data.frame(
+  term = common_terms,
+  lpm = as.numeric(coef(lpm)[common_terms]),
+  logit_ape = as.numeric(coef(logit_mod)[common_terms]) * ape_scale
+)
+ape_scale
+ape_cmp[ape_cmp$term %in% c(
+  "tenure", "ContractOne year", "ContractTwo year",
+  "PaperlessBillingYes", "PaymentMethodElectronic check",
+  "OnlineSecurityYes", "TechSupportYes"
+), ]
+```
+
+Near the middle of the data several slopes agree in sign (contract, paperless billing, electronic cheque). Tenure is the exception: the LPM coefficient and the logistic average partial effect differ because `tenure` and `TotalCharges` share the same variation. That is a reminder that “use every column” is a starting specification, not a licence to read every coefficient as a separate lever.
+
+Agreement of *average* slopes is also *not* a defence of using the LPM as $\hat p$: the average slope can look fine while individual fitted values are still negative.
+
+## Two accounts, same services, different lock-in
+
+Fix every covariate at the training-set median (numeric) or mode (factor), then move `Contract` and `tenure`. When tenure changes, `TotalCharges` is reset to `tenure * MonthlyCharges` so the profile does not combine a 60-month customer with a 28-month bill. The LPM profile can leave $[0,1]$; the logistic profile cannot.
+
+```{r}
+#| label: profiles
+#| fig-cap: "Full-model predictions as tenure and contract change; other covariates held at typical training values."
+mode_factor <- function(x) {
+  tab <- sort(table(x), decreasing = TRUE)
+  factor(names(tab)[1], levels = levels(x))
+}
+base_row <- telco_train[1, , drop = FALSE]
+num_vars <- setdiff(names(telco_train)[vapply(telco_train, is.numeric, logical(1))], "Churn")
+fac_vars <- names(telco_train)[vapply(telco_train, is.factor, logical(1))]
+for (v in num_vars) base_row[[v]] <- median(telco_train[[v]])
+for (v in fac_vars) base_row[[v]] <- mode_factor(telco_train[[v]])
+
+make_profile <- function(contract, tenure_seq = 0:72) {
+  out <- base_row[rep(1, length(tenure_seq)), ]
+  out$Contract <- factor(contract, levels = levels(telco_train$Contract))
+  out$tenure <- tenure_seq
+  out$TotalCharges <- out$tenure * out$MonthlyCharges
+  out
+}
+prof <- rbind(make_profile("Month-to-month"), make_profile("Two year"))
+prof$lpm <- predict(lpm, newdata = prof)
+prof$logit <- predict(logit_mod, newdata = prof, type = "response")
+prof_long <- pivot_longer(prof, cols = c("lpm", "logit"), names_to = "model", values_to = "pred")
+prof_long$model <- ifelse(prof_long$model == "lpm", "Linear probability", "Logistic")
+
+ggplot(prof_long, aes(x = tenure, y = pred, colour = Contract, linetype = model)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted") +
+  scale_colour_manual(values = c("Month-to-month" = "#d7191c", "Two year" = "#2c7bb6")) +
+  labs(
+    x = "Tenure (months)",
+    y = "Predicted churn probability",
+    linetype = "Model",
+    title = "Full-model profiles: LPM can go negative; logistic stays in (0, 1)"
+  )
+```
+
+```{r}
+#| label: two-accounts
+two_accounts <- rbind(
+  make_profile("Month-to-month", tenure_seq = 1),
+  make_profile("Two year", tenure_seq = 60)
+)
+two_accounts$account <- c("New, month-to-month", "Long tenure, two-year")
+two_accounts$lpm <- predict(lpm, newdata = two_accounts)
+two_accounts$logit <- predict(logit_mod, newdata = two_accounts, type = "response")
+two_accounts$logit_link <- predict(logit_mod, newdata = two_accounts, type = "link")
+two_accounts[, c("account", "tenure", "Contract", "lpm", "logit", "logit_link")]
+```
+
+The second row is the practical illustration: the logistic model returns a small positive probability; the LPM can return a negative “probability” for the same typical long-tenure, two-year profile. Checking `type = "link"` recovers the log-odds $\mathbf{x}^\top\hat{\boldsymbol{\beta}}$; exponentiating $e^{\eta}/(1+e^{\eta})$ reproduces `type = "response"`.
+
+# Checking the model, not decorating it
+
+Prediction metrics belong on data that were not used to estimate $\boldsymbol{\beta}$. The split in `R/01_prepare_data.R` holds out $30\%$ of the rows.
+
+The same hold-out checks are in `R/05_assessment.R`.
+
+```{r}
+#| label: assess-scores
+lpm_test_p <- predict(lpm, newdata = telco_test)
+logit_test_p <- predict(logit_mod, newdata = telco_test, type = "response")
+y_test <- telco_test$Churn
+c(
+  lpm_outside = sum(lpm_test_p < 0 | lpm_test_p > 1),
+  logit_outside = sum(logit_test_p < 0 | logit_test_p > 1)
+)
+
+brier <- function(y, p) mean((p - y)^2)
+c(brier_lpm = brier(y_test, lpm_test_p), brier_logit = brier(y_test, logit_test_p))
+```
+
+The **Brier score** $\frac{1}{n}\sum_i(\hat p_i-y_i)^2$ is a proper scoring rule for probabilities: it penalises both bad ranking and bad calibration. It is defined for the LPM even when $\hat p$ is negative; that does not make those values usable as stakes in a retention budget.
+
+## Thresholds and the confusion matrix
+
+A fitted probability becomes a $0/1$ call only after a cut $c$:
+$$
+\hat Y = \mathbf{1}\{\hat p \ge c\}.
+$$
+The usual default $c=0.5$ is a *symmetric loss* rule, not a law of nature. The training churn rate is about `r percent(mean(telco_train$Churn), accuracy = 0.1)`. Always predicting “no churn” already achieves accuracy `r round(mean(telco_test$Churn == 0), 3)` on the test set. Any serious accuracy number must beat that baseline.
+
+```{r}
+#| label: confusion
+confusion_at <- function(y, p, threshold = 0.5) {
+  yhat <- as.integer(p >= threshold)
+  tp <- sum(y == 1 & yhat == 1)
+  tn <- sum(y == 0 & yhat == 0)
+  fp <- sum(y == 0 & yhat == 1)
+  fn <- sum(y == 1 & yhat == 0)
+  n <- length(y)
+  list(
+    threshold = threshold,
+    table = matrix(
+      c(tn, fp, fn, tp),
+      nrow = 2, byrow = TRUE,
+      dimnames = list(observed = c("0", "1"), predicted = c("0", "1"))
+    ),
+    accuracy = (tp + tn) / n,
+    sensitivity = ifelse((tp + fn) > 0, tp / (tp + fn), NA_real_),
+    specificity = ifelse((tn + fp) > 0, tn / (tn + fp), NA_real_),
+    precision = ifelse((tp + fp) > 0, tp / (tp + fp), NA_real_)
+  )
+}
+
+thr_rate <- mean(telco_train$Churn)
+list(
+  lpm_0.5 = confusion_at(y_test, lpm_test_p, 0.5),
+  logit_0.5 = confusion_at(y_test, logit_test_p, 0.5),
+  lpm_base = confusion_at(y_test, lpm_test_p, thr_rate),
+  logit_base = confusion_at(y_test, logit_test_p, thr_rate)
+)
+mean(y_test == 0)
+```
+
+Rows of the $2\times 2$ table are the observed class; columns are the predicted class. **Sensitivity** (recall) is $\mathrm{TP}/(\mathrm{TP}+\mathrm{FN})$: the share of actual churners flagged. **Specificity** is $\mathrm{TN}/(\mathrm{TN}+\mathrm{FP})$. **Precision** is $\mathrm{TP}/(\mathrm{TP}+\mathrm{FP})$: among those flagged, how many actually left.
+
+At $c=0.5$ the two models look similar on accuracy, because most mass of $\hat p$ sits below $1/2$. Sensitivity is the more relevant operating characteristic if missed churn is the costly error. Lowering $c$ toward the sample rate raises sensitivity and spends specificity. That trade-off is a business choice (cost of a retention offer versus cost of a lost customer), not a statistical one.
+
+## Ranking: ROC and AUC
+
+The ROC curve traces sensitivity against $1-\text{specificity}$ as $c$ moves from $1$ to $0$. The area under the curve (AUC) is $P(\hat p_1>\hat p_0)$ for a random churner and a random non-churner. It evaluates **ranking**, not calibration.
+
+```{r}
+#| label: roc
+#| fig-cap: "Test-set ROC curves. Ranking is similar; that does not validate the LPM as a probability."
+roc_lpm <- roc(y_test, lpm_test_p, quiet = TRUE)
+roc_logit <- roc(y_test, logit_test_p, quiet = TRUE)
+c(auc_lpm = as.numeric(auc(roc_lpm)), auc_logit = as.numeric(auc(roc_logit)))
+
+roc_df <- rbind(
+  data.frame(model = "Linear probability", fpr = 1 - roc_lpm$specificities, tpr = roc_lpm$sensitivities),
+  data.frame(model = "Logistic", fpr = 1 - roc_logit$specificities, tpr = roc_logit$sensitivities)
+)
+ggplot(roc_df, aes(x = fpr, y = tpr, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 1) +
+  coord_equal() +
+  scale_colour_manual(values = c("Linear probability" = "#7b3294", "Logistic" = "#018571")) +
+  labs(
+    x = "False positive rate (1 - specificity)",
+    y = "True positive rate (sensitivity)",
+    colour = NULL,
+    title = "ROC curves on the test set"
+  )
+```
+
+On the test set the LPM and the logistic model have close AUCs (about `r round(as.numeric(auc(roc_lpm)), 3)` vs `r round(as.numeric(auc(roc_logit)), 3)`). That is expected: in the centre of the data the two mean functions are nearly linear transforms of each other, so they sort customers similarly. AUC will not advertise the LPM's negative fitted values. Calibration and the support of $\hat p$ will.
+
+## Calibration
+
+Bin customers by $\hat p$ (or by the raw LPM fitted value) and compare the bin's mean prediction with its observed churn rate. A calibrated probability model tracks the $45^\circ$ line.
+
+```{r}
+#| label: calibration
+#| fig-cap: "Reliability diagram on the test set. LPM bins can have a negative mean prediction."
+calibration_df <- function(y, p, model, n_bins = 10) {
+  br <- unique(quantile(p, probs = seq(0, 1, length.out = n_bins + 1), na.rm = TRUE))
+  if (length(br) < 3) {
+    br <- seq(min(p, na.rm = TRUE), max(p, na.rm = TRUE), length.out = 5)
+  }
+  cuts <- cut(p, breaks = br, include.lowest = TRUE)
+  data.frame(y = y, p = p, bin = cuts, model = model) %>%
+    group_by(model, bin) %>%
+    summarise(mean_pred = mean(p), mean_obs = mean(y), n = n(), .groups = "drop")
+}
+cal <- rbind(
+  calibration_df(y_test, lpm_test_p, "Linear probability"),
+  calibration_df(y_test, logit_test_p, "Logistic")
+)
+ggplot(cal, aes(x = mean_pred, y = mean_obs, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n), alpha = 0.85) +
+  geom_line() +
+  scale_colour_manual(values = c("Linear probability" = "#7b3294", "Logistic" = "#018571")) +
+  labs(
+    x = "Mean predicted value",
+    y = "Observed churn rate",
+    colour = NULL,
+    size = "Bin size",
+    title = "Calibration on the test set (equal-count bins)"
+  )
+```
+
+The logistic bins stay in $(0,1)$ and follow the diagonal reasonably. The LPM bins extend to **negative** mean predictions, which cannot match an observed rate in $[0,1]$. Clipping LPM fitted values to $[0,1]$ after the fact hides the problem in a plot; it does not make the linear index a likelihood.
+
+## Residuals for a Bernoulli GLM
+
+Pearson or deviance residuals plotted against $\hat p$ are still two bands. A more readable check is a **binned residual plot**: average $Y_i-\hat p_i$ inside bins of $\hat p_i$. Under a correct mean, those averages fluctuate around $0$ with scale about $\sqrt{\hat p(1-\hat p)/n_{\text{bin}}}$. Systematic curves would suggest a missing nonlinearity (for example, tenure as a spline, or an interaction between fibre and contract). The training plot here is a coarse goodness-of-fit diagnostic, not a licence to add a dozen interactions.
+
+```{r}
+#| label: binned-resid
+#| fig-cap: "Binned residuals of the logistic fit on the training set."
+n_bin <- 20
+logit_res <- data.frame(p = fitted(logit_mod), r = telco_train$Churn - fitted(logit_mod))
+logit_res$bin <- cut(
+  logit_res$p,
+  breaks = unique(quantile(logit_res$p, probs = seq(0, 1, length.out = n_bin + 1))),
+  include.lowest = TRUE
+)
+binned <- logit_res %>%
+  group_by(bin) %>%
+  summarise(p = mean(p), r = mean(r), n = n(), .groups = "drop")
+se <- sqrt(binned$p * (1 - binned$p) / binned$n)
+ggplot(binned, aes(x = p, y = r)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_ribbon(aes(ymin = -2 * se, ymax = 2 * se), alpha = 0.15, fill = "#018571") +
+  geom_point(colour = "#018571") +
+  labs(
+    x = "Fitted P(churn)",
+    y = "Mean residual (observed - fitted)",
+    title = "Binned residuals for the logistic model (training set)"
+  )
+```
+
+Cook's distances flag training rows whose deletion would move $\hat{\boldsymbol{\beta}}$. Large values are typically rare contract/service combinations. They are worth a look; they are not automatically errors.
+
+```{r}
+#| label: cooks
+#| fig-cap: "Cook's distance for each training observation in the logistic GLM."
+cooks <- cooks.distance(logit_mod)
+top_infl <- order(cooks, decreasing = TRUE)[1:8]
+cbind(
+  telco_train[top_infl, c("tenure", "Contract", "MonthlyCharges", "Churn")],
+  cook = cooks[top_infl],
+  p_hat = fitted(logit_mod)[top_infl]
+)
+ggplot(data.frame(i = seq_along(cooks), cook = cooks), aes(x = i, y = cook)) +
+  geom_point(alpha = 0.25, colour = "#018571") +
+  labs(x = "Observation index (training)", y = "Cook's distance", title = "Influence on the logistic fit")
+```
+
+## What this logistic model is, and is not
+
+It is a **fully parametric Bernoulli GLM** with a logit link and an additive linear index in every available predictor. It yields:
+
+- probabilities in $(0,1)$,
+- odds ratios with a precise *ceteris paribus* reading,
+- likelihood-ratio tests and Wald intervals,
+- and standard probability scores (Brier, calibration, AUC, confusion tables).
+
+It is not a claim that the logit is the only correct link, that the index is additive, or that $\hat\beta$ is a causal effect of forcing a customer onto a two-year contract. It is also not a regularised or tree-based predictor, and it does not decompose predictions into local attributions. The comparison here is narrower, and already decisive: **do not treat a $0/1$ churn flag as a continuous $Y$ in `lm()` if the object is a probability.**
+
+# Reproducing the figures and tables
+
+From the project root, after opening `churn-decision.Rproj`:
+
+```{r}
+#| label: source-scripts
+#| eval: false
+source("R/00_run_all.R")
+```
+
+| Script | Content |
+| --- | --- |
+| `R/01_prepare_data.R` | Read CSV, recodes, $70/30$ split |
+| `R/02_explore.R` | Churn mix and the main univariate views |
+| `R/03_linear_probability.R` | OLS LPM, VIF, unbounded fits, residual plot |
+| `R/04_logistic_regression.R` | Binomial GLM, odds ratios, profiles, average partial effects |
+| `R/05_assessment.R` | Test-set confusion tables, Brier, ROC, calibration, influence |
+
+Packages used: `here`, `dplyr`, `ggplot2`, `tidyr`, `scales`, `broom`, `car`, `lmtest`, `pROC`. All of them are ordinary CRAN libraries; `stats::lm` and `stats::glm` do the estimation.
