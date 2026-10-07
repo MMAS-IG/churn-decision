@@ -312,6 +312,7 @@ ggplot(telco_train, aes(x = tenure, y = Churn)) +
 ```{r}
 #| label: lpm-tidy
 tidy(lpm, conf.int = TRUE)
+print(tidy(lpm, conf.int = TRUE), n = Inf)
 ```
 
 ## Reading the LPM output
@@ -328,7 +329,7 @@ Two coefficients that *are* readable, because the corresponding variables are no
 - **One-year vs month-to-month contract:** about `r round(100 * coef(lpm)["ContractOne year"], 1)` percentage points on the probability scale.
 - **Tenure:** about `r round(1000 * coef(lpm)["tenure"], 2)` thousandths of a probability per extra month, or roughly `r round(12 * 100 * coef(lpm)["tenure"], 1)` points per extra year of tenure, as a linear approximation.
 
-`MonthlyCharges` has a huge generalised VIF because the monthly bill is almost an accounting identity in the service dummies. The model still *uses* those columns; the fibre and price coefficients should not be read as separate causal knobs. Contract, tenure, paperless billing, and payment method are the safer partial associations.
+`MonthlyCharges` has a huge generalised VIF because the monthly bill is almost an accounting identity in the service dummies. The model still *uses* those columns; the fibre, multiple lines and price coefficients should not be read as separate causal knobs. Contract, tenure, paperless billing, and payment method are the safer partial associations.
 
 The univariate plot of churn against tenure makes the geometric point without any of that complexity: a straight line fitted to $0/1$ dots **crosses $0$** at long tenure. The mean function is wrong in the tails even if it is acceptable in the middle.
 
@@ -696,14 +697,13 @@ cal <- rbind(
 )
 ggplot(cal, aes(x = mean_pred, y = mean_obs, colour = model)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_point(aes(size = n), alpha = 0.85) +
+  geom_point(size = 2.4) +
   geom_line() +
   scale_colour_manual(values = c("Linear probability" = "#7b3294", "Logistic" = "#018571")) +
   labs(
     x = "Mean predicted value",
     y = "Observed churn rate",
     colour = NULL,
-    size = "Bin size",
     title = "Calibration on the test set (equal-count bins)"
   )
 ```
@@ -712,11 +712,43 @@ The logistic bins stay in $(0,1)$ and follow the diagonal reasonably. The LPM bi
 
 ## Residuals for a Bernoulli GLM
 
-Pearson or deviance residuals plotted against $\hat p$ are still two bands. A more readable check is a **binned residual plot**: average $Y_i-\hat p_i$ inside bins of $\hat p_i$. Under a correct mean, those averages fluctuate around $0$ with scale about $\sqrt{\hat p(1-\hat p)/n_{\text{bin}}}$. Systematic curves would suggest a missing nonlinearity (for example, tenure as a spline, or an interaction between fibre and contract). The training plot here is a coarse goodness-of-fit diagnostic, not a licence to add a dozen interactions.
+In ordinary linear regression one plots $e_i=Y_i-\hat Y_i$ against $\hat Y_i$ and looks for a cloud around zero. For a Bernoulli outcome that plot cannot look like a cloud. If $Y_i=1$ the residual is $1-\hat p_i>0$; if $Y_i=0$ it is $-\hat p_i<0$. The scatter is therefore **two parallel bands**, one for each class. That pattern is a property of $0/1$ data, not evidence that the logistic mean is wrong.
+
+The GLM literature rescales the same gap $Y_i-\hat p_i$ in two standard ways. Write $v_i=\hat p_i(1-\hat p_i)$ for the Bernoulli variance at the fitted probability. The **Pearson residual** is
+$$
+r_i^{\mathrm{P}} = \frac{Y_i-\hat p_i}{\sqrt{v_i}} = \frac{Y_i-\hat p_i}{\sqrt{\hat p_i(1-\hat p_i)}}.
+$$
+If $\hat p_i$ were the true $p_i$, then $\mathbb{E}[r_i^{\mathrm{P}}\mid \mathbf{x}_i]=0$ and $\mathrm{Var}(r_i^{\mathrm{P}}\mid \mathbf{x}_i)=1$. In R: `residuals(logit_mod, type = "pearson")`.
+
+The **deviance residual** comes from the Bernoulli log-likelihood contribution of row $i$. With the convention $0\log 0=0$,
+$$
+d_i = \mathrm{sign}(Y_i-\hat p_i)\,
+\sqrt{2\Bigl\{ Y_i\log\frac{Y_i}{\hat p_i}+(1-Y_i)\log\frac{1-Y_i}{1-\hat p_i}\Bigr\}}.
+$$
+For a churner ($Y_i=1$) this reduces to $+\sqrt{-2\log\hat p_i}$; for a stayer ($Y_i=0$) it is $-\sqrt{-2\log(1-\hat p_i)}$. Squaring and summing recovers the residual deviance, $D=\sum_i d_i^2$. In R: `residuals(logit_mod, type = "deviance")`.
+
+Both $r_i^{\mathrm{P}}$ and $d_i$ are still two clouds when plotted against $\hat p_i$. They are useful as *building blocks* (for Cook's distance below, and for the deviance in `summary(glm)`). They are not a readable picture of whether the **mean function** $p(\mathbf{x})$ is misspecified.
+
+### Binned residuals
+
+A plot that *can* show misspecification averages the raw residual inside bins of $\hat p$. Split the training rows into $B$ groups of (approximately) equal size by the value of $\hat p_i$. In bin $b$ with $n_b$ customers,
+$$
+\bar r_b = \frac{1}{n_b}\sum_{i\in b}(Y_i-\hat p_i),\qquad
+\bar p_b = \frac{1}{n_b}\sum_{i\in b}\hat p_i.
+$$
+If the logistic mean is correct, $\mathbb{E}[Y_i\mid \mathbf{x}_i]=p_i$, so $\mathbb{E}[\bar r_b]\approx 0$. Treating the $\hat p_i$ as known and roughly constant inside the bin,
+$$
+\mathrm{Var}(\bar r_b) \approx \frac{\bar p_b(1-\bar p_b)}{n_b}.
+$$
+The shaded band in the figure is $\pm 2$ standard errors,
+$$
+\pm 2\sqrt{\frac{\bar p_b(1-\bar p_b)}{n_b}}.
+$$
+Under those approximations, about $95\%$ of the bin means should sit in the band if the mean is right. Points that form a **smooth curve** away from zero (rather than one or two noisy outliers) suggest a missing shape: for example tenure as a spline, or an interaction between fibre and contract. The band treats $\hat p$ as fixed, so it is a diagnostic, not an exact test. It is also not a licence to add a dozen interactions after staring at twenty bins.
 
 ```{r}
 #| label: binned-resid
-#| fig-cap: "Binned residuals of the logistic fit on the training set."
+#| fig-cap: "Binned residuals of the logistic fit on the training set. The band is ±2 SE under a correct mean."
 n_bin <- 20
 logit_res <- data.frame(p = fitted(logit_mod), r = telco_train$Churn - fitted(logit_mod))
 logit_res$bin <- cut(
@@ -739,11 +771,36 @@ ggplot(binned, aes(x = p, y = r)) +
   )
 ```
 
-Cook's distances flag training rows whose deletion would move $\hat{\boldsymbol{\beta}}$. Large values are typically rare contract/service combinations. They are worth a look; they are not automatically errors.
+### Cook's distance
+
+Binned residuals ask whether the mean is systematically wrong. Cook's distance asks whether **a few training rows** pull $\hat{\boldsymbol{\beta}}$ around.
+
+In OLS, deleting row $i$ changes the coefficient vector from $\hat{\boldsymbol{\beta}}$ to $\hat{\boldsymbol{\beta}}_{(i)}$. Cook's distance is the squared, scaled length of that change,
+$$
+D_i = \frac{\bigl(\hat{\boldsymbol{\beta}}-\hat{\boldsymbol{\beta}}_{(i)}\bigr)^\top (X^\top X)\,
+\bigl(\hat{\boldsymbol{\beta}}-\hat{\boldsymbol{\beta}}_{(i)}\bigr)}{k\,\hat\sigma^2},
+$$
+where $k$ is the number of coefficients. An algebraically equivalent form uses the residual $e_i$ and the **leverage** $h_{ii}$ (the $i$th diagonal of the hat matrix $H=X(X^\top X)^{-1}X^\top$):
+$$
+D_i = \frac{e_i^2}{k\,\hat\sigma^2}\cdot\frac{h_{ii}}{(1-h_{ii})^2}.
+$$
+Leverage $h_{ii}\in(0,1)$ is large when $\mathbf{x}_i$ is unusual in the covariate space. A large $D_i$ therefore needs **both** a large residual and non-negligible leverage: an outlier in $Y$ at an ordinary $\mathbf{x}$ need not move $\hat{\boldsymbol{\beta}}$ much, and an extreme $\mathbf{x}$ that sits on the fitted surface need not either.
+
+For a GLM, `stats::cooks.distance` uses the same idea with the **weighted** hat matrix of iteratively reweighted least squares. Let $W=\mathrm{diag}(v_1,\ldots,v_n)$ with $v_i=\hat p_i(1-\hat p_i)$ for the logit, and
+$$
+H = W^{1/2}X(X^\top W X)^{-1}X^\top W^{1/2}.
+$$
+The GLM Cook distance printed by R is
+$$
+D_i = \frac{(r_i^{\mathrm{P}})^2}{k}\cdot\frac{h_{ii}}{(1-h_{ii})^2},
+$$
+with $r_i^{\mathrm{P}}$ the Pearson residual above and $h_{ii}$ from this $H$. (There is no extra $\hat\sigma^2$: the Bernoulli variance is already in $v_i$.)
+
+A conventional rule of thumb is to look at rows with $D_i>4/n$. That cutoff is a **screen**, not a theorem. On the training sample here, $4/n=`r round(4 / nrow(telco_train), 4)`$. The index plot below is just $D_i$ against the row number so that the large values are visible; the $x$-axis has no substantive meaning. The table lists the eight largest $D_i$. They are typically long two-year contracts with $Y_i=1$ and a very small $\hat p_i$: rare in the design, badly predicted on the Pearson scale, hence high $D_i$. That is a reason to *look* at those accounts (data error? genuine rare churners?). It is not automatic grounds to drop them.
 
 ```{r}
 #| label: cooks
-#| fig-cap: "Cook's distance for each training observation in the logistic GLM."
+#| fig-cap: "Cook's distance for each training observation. The dashed line is the conventional 4/n screen."
 cooks <- cooks.distance(logit_mod)
 top_infl <- order(cooks, decreasing = TRUE)[1:8]
 cbind(
@@ -753,6 +810,7 @@ cbind(
 )
 ggplot(data.frame(i = seq_along(cooks), cook = cooks), aes(x = i, y = cook)) +
   geom_point(alpha = 0.25, colour = "#018571") +
+  geom_hline(yintercept = 4 / length(cooks), linetype = "dashed", colour = "grey30") +
   labs(x = "Observation index (training)", y = "Cook's distance", title = "Influence on the logistic fit")
 ```
 

@@ -114,7 +114,7 @@ cal <- rbind(
 )
 p_cal <- ggplot(cal, aes(x = mean_pred, y = mean_obs, colour = model)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_point(aes(size = n), alpha = 0.85) +
+  geom_point(size = 2.4, alpha = 0.9) +
   geom_line() +
   scale_colour_manual(values = c(
     "Linear probability" = "#7b3294",
@@ -124,7 +124,6 @@ p_cal <- ggplot(cal, aes(x = mean_pred, y = mean_obs, colour = model)) +
     x = "Mean predicted value",
     y = "Observed churn rate",
     colour = NULL,
-    size = "Bin size",
     title = "Calibration on the test set (equal-count bins)"
   )
 print(p_cal)
@@ -169,6 +168,7 @@ print(infl_tbl)
 
 p_cook <- ggplot(data.frame(i = seq_along(cooks), cook = cooks), aes(x = i, y = cook)) +
   geom_point(alpha = 0.25, colour = "#018571") +
+  geom_hline(yintercept = 4 / length(cooks), linetype = "dashed", colour = "grey30") +
   labs(
     x = "Observation index (training)",
     y = "Cook's distance",
