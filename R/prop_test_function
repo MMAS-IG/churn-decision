@@ -1,0 +1,7 @@
+prop_test_function <- function(fichier) {
+  data <- read.csv(fichier)
+
+  lapply(data[, 2:5], function(x) {
+    prop.table(table(x))
+  })
+}
