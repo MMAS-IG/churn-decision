@@ -204,7 +204,7 @@ ggplot(telco, aes(x = tenure, fill = factor(Churn, labels = c("No", "Yes")))) +
 #| fig-cap: "Monthly charges among churners sit higher than among stayers."
 ggplot(telco, aes(x = MonthlyCharges, fill = factor(Churn, labels = c("No", "Yes")))) +
   geom_density(alpha = 0.45) +
-  scale_fill_manual(values = c("#2c7bb6", "#d7191c"), name = "Churn") +
+  scale_fill_manual(values = c("#2c7db6", "#d7191c"), name = "Churn") +
   labs(x = "Monthly charges", y = "Density", title = "Monthly charges by churn")
 ```
 
@@ -516,8 +516,7 @@ ape_cmp[ape_cmp$term %in% c(
 ), ]
 ```
 
-Near the middle of the data several slopes agree in sign (contract, paperless billing, electronic cheque). Tenure is the exception: the LPM coefficient and the logistic average partial effect differ because `tenure` and `TotalCharges` share the same variation. That is a reminder that “use every column” is a starting specification, not a licence to read every coefficient as a separate lever.
-
+Near the middle of the data several slopes agree in sign (contract, paperless billing, electronic cheque). 
 Agreement of *average* slopes is also *not* a defence of using the LPM as $\hat p$: the average slope can look fine while individual fitted values are still negative.
 
 ## Two accounts, same services, different lock-in
