@@ -1,0 +1,711 @@
+---
+title: "A classical neural network for customer churn"
+subtitle: "One hidden layer on the IBM Telco split, then a comparison with linear and logistic regression"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    theme: cosmo
+    html-math-method: katex
+    fig-width: 7.5
+    fig-height: 4.8
+    fig-dpi: 120
+knitr:
+  opts_chunk:
+    comment: "#>"
+    message: false
+    warning: false
+    fig.path: "figures/"
+execute:
+  echo: true
+---
+
+```{r}
+#| label: setup
+library(here)
+library(dplyr)
+library(ggplot2)
+library(nnet)
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 999)
+num4 <- function(x) sprintf("%.4f", as.numeric(x))
+num3 <- function(x) sprintf("%.3f", as.numeric(x))
+dir.create(here("figures"), showWarnings = FALSE)
+dir.create(here("output", "test_predictions"), showWarnings = FALSE)
+```
+
+This note fits a **single-hidden-layer neural network** to the same churn table, and the same $70/30$ split, as [`from-linear-to-logistic-churn.qmd`](from-linear-to-logistic-churn.qmd). The outcome is still the last column, `Churn`. The predictors are still every other column except `customerID`. The network is then scored on the held-out customers, and those scores are compared with the linear probability model and the logistic regression **by reading files**, not by refitting inside the comparison.
+
+# Packages for neural networks in R
+
+R does not have one function called "neural network". Several packages fit related models. They differ in how many hidden layers they allow, which optimizer they use, and whether they need Python.
+
+## `nnet`: the package used here
+
+[`nnet`](https://cran.r-project.org/package=nnet) (Venables and Ripley) is a **recommended** package: a standard R installation already contains it. If `library(nnet)` ever fails,
+
+```r
+install.packages("nnet")
+```
+
+is enough. No Python, no GPU.
+
+`nnet()` fits a **feedforward network with one hidden layer**. There are two interfaces:
+
+- `nnet(formula, data, ...)` builds the model matrix itself. A two-level factor response is handled as classification.
+- `nnet(x, y, size, ...)` takes a numeric matrix of inputs and a numeric target.
+
+The arguments that matter for a binary probability are:
+
+| Argument | Role in this note |
+| --- | --- |
+| `size` | Number of units in the hidden layer. `size = 0` is allowed only together with `skip = TRUE` (direct connections from inputs to the output, and no hidden layer). |
+| `decay` | Weight decay. A penalty added to the fitting criterion. Default `0`. |
+| `maxit` | Maximum number of BFGS iterations. Default `100`; we use `400`. |
+| `rang` | Initial weights are drawn uniformly from `[-rang, rang]`. The help page asks for a value near `0.5` when the inputs are about $1$ in absolute value. We set `0.5`. |
+| `skip` | Add connections that skip the hidden layer. We turn this on only for `size = 0`. |
+| `entropy` | Fit by maximum conditional likelihood (Bernoulli log-likelihood) rather than least squares. The formula method turns this on by itself when the response is a two-level factor. |
+| `linout` | `TRUE` means an unbounded linear output, which is regression. The default `FALSE` is a logistic output in $(0,1)$. Leave it `FALSE` for churn. |
+| `softmax` | One output per class, used automatically when the factor has **three or more** levels. Not used for binary churn. |
+| `MaxNWts` | Safety cap on the number of weights. Default `1000`. We raise it to `10000`. |
+| `trace` | Print the criterion at each iteration. We turn it off. |
+| `abstol`, `reltol` | Stopping rules. `abstol` stops if the criterion falls below `abstol`. `reltol` stops if a step cannot reduce the criterion by a factor of at least `1 - reltol` (`?nnet`). |
+| `Hess` | If `TRUE`, store the Hessian at the solution. We do not need standard errors of the weights. |
+
+The help page states that optimization is **BFGS**, a quasi-Newton method. At each iteration the gradient of the criterion is computed on every row of the sample passed to `nnet()`.
+
+`predict(fit, newdata, type = "raw")` returns the network output. For a two-class factor, that output is one number: the fitted probability of the **second** level. `type = "class"` applies the cut $0.5$ and returns a label. We keep the probabilities and choose the cut afterwards, as in the logistic note.
+
+Two calls that do not estimate $P(Y=1)$:
+
+- A numeric $0/1$ response, without `entropy = TRUE`, minimises a sum of squares through a logistic output. That criterion is not the Bernoulli log-likelihood.
+- `linout = TRUE` removes $\sigma$ at the output, so the fitted value is unbounded and can fall outside $[0,1]$.
+
+Every start is `fit_nnet_once()`. Its call is
+
+```r
+nnet(
+  Churn ~ .,
+  data = data,
+  size = size,
+  decay = decay,
+  maxit = maxit,
+  rang = 0.5,
+  skip = isTRUE(size == 0),
+  trace = FALSE,
+  MaxNWts = 10000
+)
+```
+
+`Churn` is a factor with levels `No`, `Yes`, in that order, so the second level is churn and `entropy` is turned on inside `nnet.formula`. The formula drops the column named `(Intercept)`.
+
+What `nnet` does not do: more than one hidden layer, dropout, minibatch training, GPU, or a built-in cross-validation loop.
+
+## `neuralnet`: several hidden layers, back-propagation
+
+[`neuralnet`](https://cran.r-project.org/package=neuralnet) is the other classical CRAN package for this model. A typical classification call is
+
+```r
+neuralnet(
+  Churn ~ tenure + MonthlyCharges + ...,
+  data = train_numeric,
+  hidden = c(10),
+  err.fct = "ce",
+  linear.output = FALSE,
+  act.fct = "logistic",
+  algorithm = "rprop+",
+  stepmax = 1e5
+)
+```
+
+`hidden` can be a vector, so `hidden = c(16, 8)` is two hidden layers. `err.fct = "ce"` is cross-entropy; `"sse"` is squared error. `linear.output = FALSE` keeps the output activation, which is what a probability needs. `algorithm` chooses the optimizer: `"backprop"`, `"rprop+"`, `"rprop-"`, `"sag"`, or `"slr"` (resilient back-propagation is the usual default). `plot()` draws the graph of units and weights. `compute()` returns the predictions.
+
+The formula interface wants **numeric** columns. Factors have to be expanded to dummies before the call. This note uses `nnet`: one hidden layer, a logistic output, entropy, and the same treatment contrasts as `lm` and `glm`.
+
+## `RSNNS`: the Stuttgart simulator
+
+[`RSNNS`](https://cran.r-project.org/package=RSNNS) wraps the Stuttgart Neural Network Simulator. `mlp()` fits a multilayer perceptron; the package also fits recurrent nets and radial basis functions. This note uses one hidden layer and a Bernoulli likelihood, which `nnet` fits.
+
+## `keras` and `torch`: deep networks
+
+[`keras`](https://cran.r-project.org/package=keras) (with TensorFlow) and [`torch`](https://cran.r-project.org/package=torch) train modern deep networks.
+
+- `keras` uses a Python backend. After `install.packages("keras")`, `keras::install_keras()` installs that backend. A binary churn net is a stack of `layer_dense()` units, ReLU in the hidden layers, a sigmoid output, `loss_binary_crossentropy`, and an Adam optimizer on minibatches.
+- `torch` ships its own LibTorch library, so it does not need Python. The model is `nn_sequential()` / `nn_linear()`, and the loss is binary cross-entropy.
+
+Use one of those when the net has several hidden layers, the inputs are images or text, or a GPU is part of the plan. This note stays with one hidden layer in `nnet`.
+
+`caret`, `mlr3`, and `tidymodels` can call `nnet` and search `size` and `decay` for you (`caret` method `"nnet"`). The search in this note is written out, so the validation rows and the test rows stay distinct in the code.
+
+## Packages shared with the logistic notes
+
+The fit itself is `nnet`. The other packages are the same as in the logistic note:
+
+| Package | Role |
+| --- | --- |
+| `here` | Project paths. |
+| `dplyr` | The tuning table and the calibration bins. |
+| `ggplot2`, `tidyr` | Figures. |
+| `pROC` | ROC curves and the DeLong interval for AUC. |
+
+`lm` and `glm` are not inside `nnet`. They are estimated on their own and scored on the same test customers as the network. The calls are in `R/compare_methods/00_export_linear_logistic.R`:
+
+```r
+lpm <- lm(churn_formula, data = telco_train)
+logit_mod <- glm(churn_formula, data = telco_train, family = binomial(link = "logit"))
+```
+
+# The network
+
+Let $Y_i=1$ if customer $i$ churns and $Y_i=0$ otherwise. Write $\sigma(t)=e^t/(1+e^t)$.
+
+The test indices $\mathcal{I}_{\mathrm{test}}$ are drawn in `R/01_prepare_data.R`. In that script `n` is `nrow(telco)`, the number of rows before the split. It is not $n_{\mathrm{train}}$, $n_{\mathrm{fit}}$, $n_{\mathrm{val}}$, or $n_{\mathrm{test}}$.
+
+```r
+set.seed(2026)
+n <- nrow(telco)
+test_frac <- 0.30
+test_id <- sample(seq_len(n), size = floor(test_frac * n))
+```
+
+$\mathcal{I}_{\mathrm{train}}$ is the complement. Write $n_{\mathrm{train}}=|\mathcal{I}_{\mathrm{train}}|$ and $n_{\mathrm{test}}=|\mathcal{I}_{\mathrm{test}}|$. Inside the training rows only, `R/neural_network/01_fit_network.R` draws the validation indices:
+
+```r
+set.seed(2027)
+val_n <- floor(0.20 * nrow(nn_train))
+nn_val_id <- sample(seq_len(nrow(nn_train)), size = val_n)
+nn_fit_slice <- nn_train[-nn_val_id, , drop = FALSE]
+nn_val_slice <- nn_train[nn_val_id, , drop = FALSE]
+```
+
+$\mathcal{I}_{\mathrm{val}}$ is `nn_val_id` and $\mathcal{I}_{\mathrm{fit}}=\mathcal{I}_{\mathrm{train}}\setminus\mathcal{I}_{\mathrm{val}}$, with $n_{\mathrm{val}}=|\mathcal{I}_{\mathrm{val}}|$ and $n_{\mathrm{fit}}=|\mathcal{I}_{\mathrm{fit}}|$. The rows in $\mathcal{I}_{\mathrm{test}}$ are not used to choose $H$, $\lambda$, or the weights.
+
+Three predictors of $P(Y_i=1\mid \mathbf{x}_i)$ are kept until the test set:
+
+| Symbol | Model | Code |
+| --- | --- | --- |
+| $\hat p_i^{\mathrm{LPM}}$ | $\mathbf{x}_i^\top\hat{\boldsymbol{\beta}}_{\mathrm{OLS}}$. Can leave $[0,1]$. | `lm(churn_formula, data = telco_train)` |
+| $\hat p_i^{\mathrm{GLM}}$ | $\sigma(\mathbf{x}_i^\top\hat{\boldsymbol{\beta}}_{\mathrm{MLE}})$. Unpenalized logistic regression. | `glm(churn_formula, data = telco_train, family = binomial(link = "logit"))` |
+| $\hat p_i(H,\lambda)$ | A `nnet` fit with $H$ hidden units and weight decay $\lambda$. | `fit_nnet_once()` |
+
+$(H^\star,\lambda^\star)$ is the `nnet` fit saved under the label "Neural network". $\hat p^{\mathrm{GLM}}$ is estimated by `glm` and saved as its own file.
+
+## Why $H=0$ is on the grid, and why it is not $\hat p^{\mathrm{GLM}}$
+
+With skip-layer connections and no hidden unit,
+$$
+\hat p_i(0,\lambda)=\sigma\big(b+\tilde{\mathbf{x}}_i^\top\mathbf{w}\big).
+$$
+This is a logistic function of $\tilde{\mathbf{x}}_i$. The fitted vector is not $\hat p^{\mathrm{GLM}}$:
+
+| | $\hat p^{\mathrm{GLM}}$ | $\hat p(0,\lambda)$ |
+| --- | --- | --- |
+| Inputs | Original $\mathbf{x}$ | Standardized numerics $\tilde{\mathbf{x}}$ |
+| Penalty | None | $\lambda\sum_k w_k^2$, bias included |
+| Optimizer | Fisher scoring in `glm` | BFGS in `nnet` |
+
+$H=0$ is on the grid so that $B_{\mathrm{val}}(H,\lambda)$ for $H\ge 1$ can be compared with a logistic fit from the same program, on the same scaled inputs, with the same penalty. $(H_0,\lambda_0)$ is the pair with the smallest $B_{\mathrm{val}}$ on the whole grid, so $H_0$ may be $0$. $(H^\star,\lambda^\star)$ is the pair with the smallest $B_{\mathrm{val}}$ among rows with $H\ge 1$. If $H_0=0$, then $B_{\mathrm{val}}(0,\lambda_0)\le B_{\mathrm{val}}(H,\lambda)$ for every $H\ge 1$ on the grid. $\hat p^{\mathrm{GLM}}$ and $\hat p(H^\star,\lambda^\star)$ are both scored on $\mathcal{I}_{\mathrm{test}}$.
+
+After `select_network()` sorts the grid, `01_fit_network.R` reads the two pairs off that table:
+
+```r
+nn_benchmark <- nn_selection[1, ]                 # (H_0, lambda_0), H_0 may be 0
+nn_hidden <- nn_selection[nn_selection$size > 0, ]
+nn_chosen <- nn_hidden[1, ]                       # (H*, lambda*)
+```
+
+`size` in the table is $H$. `decay` is $\lambda$.
+
+## From $\mathbf{x}$ to a probability
+
+After dummy coding and scaling, the input of customer $i$ is $\tilde{\mathbf{x}}_i\in\mathbb{R}^d$ with $d=23$. For $H\ge 1$,
+$$
+z_{ih}=\sigma\Big(b_h^{(1)}+\sum_{j=1}^{d} w_{hj}^{(1)}\tilde x_{ij}\Big),
+\quad h=1,\ldots,H,
+$$
+$$
+\eta_i=b^{(2)}+\sum_{h=1}^{H} w_h^{(2)} z_{ih},
+\qquad
+\hat p_i(H,\lambda)=\sigma(\eta_i).
+$$
+For the GLM, $\operatorname{logit}(\hat p_i^{\mathrm{GLM}})=\mathbf{x}_i^\top\boldsymbol{\beta}$. For the network, $\operatorname{logit}(\hat p_i(H,\lambda))=\eta_i$, and $\eta_i$ is not linear in $\tilde{\mathbf{x}}_i$.
+
+The parameter count is $(d+1)H+(H+1)=25H+1$: each hidden unit has $d$ weights and one bias, and the output has $H$ weights and one bias. For $H=0$ the skip layer has $d+1=24$ parameters.
+
+## The fitting criterion
+
+For a fixed $\lambda$, BFGS minimises $\mathcal{C}_{\mathcal{S}}$ with respect to $\mathbf{w}$ on the sample $\mathcal{S}$ passed to that fit. During the search $\mathcal{S}=\mathcal{I}_{\mathrm{fit}}$; at the final refit $\mathcal{S}=\mathcal{I}_{\mathrm{train}}$.
+$$
+\mathcal{C}_{\mathcal{S}}(\mathbf{w})
+=-\sum_{i\in\mathcal{S}}\Big(y_i\log\hat p_i+(1-y_i)\log(1-\hat p_i)\Big)
++\lambda\sum_k w_k^2.
+$$
+The first sum is the Bernoulli negative log-likelihood, the same likelihood as `glm`, with each observation entering once. The index $k$ runs over every weight and every bias, and $\lambda$ is the same number in every term of the second sum. $\lambda$ is not a free coordinate of $\mathbf{w}$: each fit uses one value from the grid $\lambda\in\{0.05,0.5,2\}$. `fit$value` stores $\mathcal{C}_{\mathcal{S}}(\hat{\mathbf{w}})$, so it includes $\lambda\sum_k \hat w_k^2$.
+
+- For one fixed pair $(H,\lambda)$ on one fixed $\mathcal{S}$, three random starts give three values of $\mathcal{C}_{\mathcal{S}}$. `select_network()` keeps the smallest:
+
+```r
+criteria <- vapply(starts, function(f) f$value, numeric(1))
+best <- which.min(criteria)
+fit <- starts[[best]]
+```
+
+$\mathcal{I}_{\mathrm{val}}$ is not used in `which.min`.
+
+- Pairs $(H,\lambda)$ are ranked by $B_{\mathrm{val}}(H,\lambda)$, defined below. $\mathcal{C}_{\mathcal{S}}$ is not used for that ranking: $\mathcal{C}_{\mathcal{S}}$ contains $\lambda\sum_k w_k^2$, and during the search it is computed on $\mathcal{I}_{\mathrm{fit}}$, not on $\mathcal{I}_{\mathrm{val}}$.
+
+## How $\tilde{\mathbf{x}}$ is built, and why there is no intercept column
+
+The three numeric predictors are `tenure`, `MonthlyCharges`, and `TotalCharges`. On the sample used to fit,
+$$
+\tilde x_{ij}=\frac{x_{ij}-\bar x_j}{s_j},
+$$
+with $\bar x_j$ the sample mean and $s_j$ the sample standard deviation (`sd`, divisor $|\mathcal{S}|-1$) on the sample $\mathcal{S}$ used to fit. `predictor_center_scale()` computes those two vectors for the numeric columns only:
+
+```r
+vars <- setdiff(names(df)[vapply(df, is.numeric, logical(1))], "Churn")
+center <- vapply(df[vars], mean, numeric(1))
+scale <- vapply(df[vars], stats::sd, numeric(1))
+```
+
+A dummy stays in $\{0,1\}$. On $\mathcal{S}$, a scaled numeric predictor has sample standard deviation $1$.
+
+During the search, $\mathcal{S}=\mathcal{I}_{\mathrm{fit}}$. `select_network()` estimates the constants there and applies them to both slices:
+
+```r
+spec <- predictor_center_scale(train_raw)
+train <- apply_center_scale(train_raw, spec)
+val <- apply_center_scale(val_raw, spec)
+```
+
+`refit_network()` recomputes them on $\mathcal{I}_{\mathrm{train}}$:
+
+```r
+spec <- predictor_center_scale(train_raw)
+train <- apply_center_scale(train_raw, spec)
+```
+
+`01_fit_network.R` scales $\mathcal{I}_{\mathrm{test}}$ with that same `spec`:
+
+```r
+nn_test_scaled <- apply_center_scale(nn_test, nn_spec)
+```
+
+The rows in $\mathcal{I}_{\mathrm{test}}$ do not enter $\bar x_j$, $s_j$, or $(H^\star,\lambda^\star)$.
+
+Factors use the same treatment contrasts as $\hat p^{\mathrm{GLM}}$. The reference levels are set in `R/01_prepare_data.R`:
+
+```r
+telco$Contract <- relevel(telco$Contract, ref = "Month-to-month")
+telco$InternetService <- relevel(telco$InternetService, ref = "DSL")
+telco$PaymentMethod <- relevel(telco$PaymentMethod, ref = "Bank transfer (automatic)")
+telco$gender <- relevel(telco$gender, ref = "Female")
+```
+
+So the column `ContractOne year` is $1$ for a one-year contract and $0$ otherwise, in both the GLM and the network. The reference level has no column.
+
+`model.matrix` still builds a column of ones. `nnet.formula` deletes the column named `(Intercept)` before the fit. The additive constants in the map are already $b_h^{(1)}$ in $z_{ih}$ and $b^{(2)}$ in $\eta_i$. A column of ones would be a second constant in the same linear form. The reference levels (month-to-month, DSL, bank transfer, female) have no column, as in the GLM.
+
+## The rule for $(H^\star,\lambda^\star)$
+
+The grid, in `01_fit_network.R`, is
+$$
+H\in\{0,2,5,10\},\qquad \lambda\in\{0.05,\,0.5,\,2\}.
+$$
+
+For each pair $(H,\lambda)$ the search does three things.
+
+1. On $\mathcal{I}_{\mathrm{fit}}$, `select_network()` runs three starts. Start $s$ uses
+
+```r
+seed <- 100000L + as.integer(size) * 1000L +
+  as.integer(round(decay * 100)) * 10L + as.integer(s)
+```
+
+then `fit_nnet_once(..., maxit = 400)`. Initial weights are uniform on $[-0.5,0.5]$. Keep
+$$
+\mathbf{w}_{H,\lambda}=\arg\min_{s=1,2,3}\mathcal{C}_{\mathcal{I}_{\mathrm{fit}}}(\mathbf{w}^{(s)}),
+$$
+which is the `which.min(criteria)` block above. `convergence == 0` means BFGS stopped before `maxit`; `1` means it reached `maxit`.
+2. With that single $\mathbf{w}_{H,\lambda}$, `select_network()` predicts $\mathcal{I}_{\mathrm{val}}$ and stores
+$$
+B_{\mathrm{val}}(H,\lambda)
+=\frac{1}{n_{\mathrm{val}}}\sum_{i\in\mathcal{I}_{\mathrm{val}}}\big(\hat p_i(H,\lambda)-y_i\big)^2.
+$$
+The code is `val_brier = brier_score(y_val, p_val)`. `train_brier` is the same average on $\mathcal{I}_{\mathrm{fit}}$, so its denominator is $n_{\mathrm{fit}}$.
+3. After every pair has a $B_{\mathrm{val}}$, `select_network()` sorts by $B_{\mathrm{val}}$, then by $H$ ascending, then by $\lambda$ descending:
+
+```r
+ord <- order(table$val_brier, table$size, -table$decay)
+table <- table[ord, ]
+```
+
+The first row is $(H_0,\lambda_0)$. The first row with $H\ge 1$ is $(H^\star,\lambda^\star)$, the two lines shown above.
+
+The standard error next to $B_{\mathrm{val}}$ uses the validation squared errors $e_i=(\hat p_i-y_i)^2$:
+$$
+\mathrm{SE}=\frac{s_e}{\sqrt{n_{\mathrm{val}}}},
+$$
+with $s_e$ their sample standard deviation. `brier_se()` is that ratio:
+
+```r
+err <- (as.numeric(p) - as.numeric(y))^2
+stats::sd(err) / sqrt(length(err))
+```
+
+If $\big|B_{\mathrm{val}}(H,\lambda)-B_{\mathrm{val}}(H',\lambda')\big|$ is small relative to these standard errors, $\mathcal{I}_{\mathrm{val}}$ does not distinguish $(H,\lambda)$ from $(H',\lambda')$.
+
+$\mathcal{I}_{\mathrm{test}}$ is still unused. `refit_network()` minimises $\mathcal{C}_{\mathcal{I}_{\mathrm{train}}}$ at the already chosen $(H^\star,\lambda^\star)$, with five starts and seeds `20000L + s`. It keeps the start with the smallest criterion:
+
+```r
+criteria <- vapply(fits, function(f) f$value, numeric(1))
+best <- which.min(criteria)
+```
+
+`01_fit_network.R` then saves `nnet_probability(nn_fit, nn_test_scaled)` on $\mathcal{I}_{\mathrm{test}}$ as method `03_neural_network`.
+
+# Fit on the shared split
+
+```{r}
+#| label: fit-network
+source(here("R", "neural_network", "01_fit_network.R"))
+```
+
+```{r}
+#| label: network-shape
+c(
+  inputs = nn_fit$n[1],
+  hidden = nn_fit$n[2],
+  output = nn_fit$n[3],
+  weights = length(nn_fit$wts)
+)
+nn_fit$coefnames
+```
+
+The printed table is $B_{\mathrm{val}}(H,\lambda)$ after the sort in `select_network()`. Each row is one pair $(H,\lambda)$. `converged` is `r if (all(nn_selection$converged)) "TRUE on every row" else "not TRUE on every row"`.
+
+$(H_0,\lambda_0)$ is the first row: $H_0=`r nn_benchmark$size`$, $\lambda_0=`r nn_benchmark$decay`$, $B_{\mathrm{val}}=`r num4(nn_benchmark$val_brier)`$ with $\mathrm{SE}=`r num4(nn_benchmark$val_brier_se)`$. $(H^\star,\lambda^\star)$ is the first row with $H\ge 1$: $H^\star=`r nn_chosen$size`$, $\lambda^\star=`r nn_chosen$decay`$, $B_{\mathrm{val}}=`r num4(nn_chosen$val_brier)`$ with $\mathrm{SE}=`r num4(nn_chosen$val_brier_se)`$.
+$$
+\big|B_{\mathrm{val}}(H^\star,\lambda^\star)-B_{\mathrm{val}}(H_0,\lambda_0)\big|
+=`r num4(abs(nn_chosen$val_brier - nn_benchmark$val_brier))`,
+$$
+and $\mathrm{SE}(B_{\mathrm{val}}(H_0,\lambda_0))=`r num4(nn_benchmark$val_brier_se)`$. The difference is smaller than this standard error.
+
+The largest $B_{\mathrm{val}}$ is at $H=`r nn_selection$size[which.max(nn_selection$val_brier)]`$, $\lambda=`r nn_selection$decay[which.max(nn_selection$val_brier)]`$: $B_{\mathrm{val}}=`r num4(max(nn_selection$val_brier))`$ and the fitting-slice Brier is $`r num3(nn_selection$train_brier[which.max(nn_selection$val_brier)])`$.
+
+A constant forecast $\hat p_i=\bar y_{\mathrm{train}}$ has Brier score $\bar y_{\mathrm{train}}(1-\bar y_{\mathrm{train}})\approx `r num3(mean(telco_train$Churn) * (1 - mean(telco_train$Churn)))`$. Every grid row has a smaller $B_{\mathrm{val}}$.
+
+The refit on all $`r nrow(telco_train)`$ training rows kept start $`r nn_refit$start_kept`$ of $`r length(nn_refit$criteria)`$. The five values of $\mathcal{C}_{\mathcal{I}_{\mathrm{train}}}$ are $`r paste(round(nn_refit$criteria, 1), collapse = ", ")`$. Their range is $`r num3(diff(range(nn_refit$criteria)))`$. The network predicted on $\mathcal{I}_{\mathrm{test}}$ has $d=`r nn_fit$n[1]`$, $H^\star=`r nn_fit$n[2]`$, one output, and $`r length(nn_fit$wts)`$ weights. `nn_fit$coefnames` lists the $d$ inputs after the intercept column has been dropped: the same dummy names as in the GLM, plus the three standardized numerics.
+
+In the GLM, $\partial\eta/\partial x_j=\beta_j$. For the network, $\partial\hat p/\partial\tilde x_j$ depends on $\tilde{\mathbf{x}}$ through the $z_h$.
+
+# Scores on the held-out customers
+
+For a sample $\mathcal{S}$ with $n_{\mathcal{S}}=|\mathcal{S}|$ and a score $\hat p$,
+$$
+B_{\mathcal{S}}(\hat p)=\frac{1}{n_{\mathcal{S}}}\sum_{i\in\mathcal{S}}(\hat p_i-y_i)^2,
+\qquad
+L_{\mathcal{S}}(\hat p)=-\frac{1}{n_{\mathcal{S}}}\sum_{i\in\mathcal{S}}\Big(y_i\log\hat p_i+(1-y_i)\log(1-\hat p_i)\Big).
+$$
+$B_{\mathcal{I}_{\mathrm{val}}}$ is the $B_{\mathrm{val}}$ of the search. Below, $\hat p_i=\hat p_i(H^\star,\lambda^\star)$, and the two samples are $\mathcal{I}_{\mathrm{train}}$ and $\mathcal{I}_{\mathrm{test}}$. `brier_score()` and `log_loss()` are these averages:
+
+```r
+brier_score <- function(y, p) {
+  mean((as.numeric(p) - as.numeric(y))^2)
+}
+log_loss <- function(y, p, eps = 1e-6) {
+  p <- pmin(pmax(as.numeric(p), eps), 1 - eps)
+  y <- as.numeric(y)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+```
+
+`log_loss()` clips $\hat p$ to $[10^{-6},1-10^{-6}]$ so that a value at $0$ or $1$ does not make $L_{\mathcal{S}}$ infinite. $\lambda\sum_k w_k^2$ is not in $L_{\mathcal{S}}$. `nn_fit$value` stores $\mathcal{C}_{\mathcal{I}_{\mathrm{train}}}(\hat{\mathbf{w}})$, the summed negative log-likelihood plus the penalty, so it is not $L_{\mathcal{I}_{\mathrm{train}}}$. `02_assess_network.R` evaluates both samples in `nn_holdout`:
+
+```r
+train = c(
+  brier_score(nn_y_train, nn_train_p),
+  log_loss(nn_y_train, nn_train_p),
+  as.numeric(auc(roc_safe(nn_y_train, nn_train_p)))
+),
+test = c(
+  brier_score(nn_y_test, nn_test_p),
+  log_loss(nn_y_test, nn_test_p),
+  as.numeric(auc(roc_safe(nn_y_test, nn_test_p)))
+)
+```
+
+$B_{\mathcal{S}}$ is defined for $\hat p^{\mathrm{LPM}}$ when some $\hat p_i$ are negative. $L_{\mathcal{S}}$ clips those values first.
+
+**AUC.** Let $\mathbf{x}^{(1)}$ be the covariates of a customer drawn uniformly from $\{i\in\mathcal{S}:Y_i=1\}$, and let $\mathbf{x}^{(0)}$ be drawn independently and uniformly from $\{i\in\mathcal{S}:Y_i=0\}$. Write $\hat p(\mathbf{x})$ for the score at $\mathbf{x}$. This is not the indexed score $\hat p_i=\hat p(\mathbf{x}_i)$. On the sample $\mathcal{S}$,
+$$
+\mathrm{AUC}_{\mathcal{S}}
+=P\big(\hat p(\mathbf{x}^{(1)})>\hat p(\mathbf{x}^{(0)})\big)
++\frac12 P\big(\hat p(\mathbf{x}^{(1)})=\hat p(\mathbf{x}^{(0)})\big).
+$$
+The second term is the contribution of ties. `roc_safe()` builds the curve that `auc()` integrates:
+
+```r
+roc(response = y, predictor = p, levels = c(0, 1), direction = "<", quiet = TRUE)
+```
+
+`direction = "<"` means a larger score is counted as more evidence for $Y=1$. If $g$ is strictly increasing, replacing $\hat p(\mathbf{x})$ by $g(\hat p(\mathbf{x}))$ leaves $\mathrm{AUC}_{\mathcal{S}}$ unchanged.
+
+**A cut.** On $\mathcal{I}_{\mathrm{test}}$, $\hat Y_i=\mathbf{1}\{\hat p_i\ge c\}$. Write
+$$
+\mathrm{TP}=\sum_{i\in\mathcal{I}_{\mathrm{test}}}\mathbf{1}\{Y_i=1,\hat Y_i=1\},
+\quad
+\mathrm{FN}=\sum_{i\in\mathcal{I}_{\mathrm{test}}}\mathbf{1}\{Y_i=1,\hat Y_i=0\},
+$$
+$$
+\mathrm{FP}=\sum_{i\in\mathcal{I}_{\mathrm{test}}}\mathbf{1}\{Y_i=0,\hat Y_i=1\},
+\quad
+\mathrm{TN}=\sum_{i\in\mathcal{I}_{\mathrm{test}}}\mathbf{1}\{Y_i=0,\hat Y_i=0\}.
+$$
+$$
+\mathrm{Sens}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FN}},\quad
+\mathrm{Spec}=\frac{\mathrm{TN}}{\mathrm{TN}+\mathrm{FP}},\quad
+\mathrm{Prec}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FP}},\quad
+\mathrm{Acc}=\frac{\mathrm{TP}+\mathrm{TN}}{n_{\mathrm{test}}}.
+$$
+`confusion_at()` is those four ratios. The assignment of the label is
+
+```r
+yhat <- as.integer(p >= threshold)
+```
+
+The two cuts reported below are $c=0.5$ and $c=\bar y_{\mathrm{train}}=\frac{1}{n_{\mathrm{train}}}\sum_{i\in\mathcal{I}_{\mathrm{train}}} y_i$.
+
+Suppose $\hat p_i=P(Y_i=1\mid\mathbf{x}_i)$. Let $C_{10}$ be the cost of $\hat Y_i=1$ when $Y_i=0$, and $C_{01}$ the cost of $\hat Y_i=0$ when $Y_i=1$. A correct label has cost $0$. For a customer with $P(Y_i=1\mid\mathbf{x}_i)=p$, the expected costs of the two actions are
+$$
+R(0,p)=p\,C_{01},
+\qquad
+R(1,p)=(1-p)\,C_{10}.
+$$
+The action $\hat Y_i=1$ has the smaller expected cost when $R(1,p)\le R(0,p)$. Rearranging,
+$$
+(1-p)C_{10}\le p\,C_{01}
+\iff
+C_{10}\le p(C_{10}+C_{01}).
+$$
+If $C_{10}+C_{01}>0$, divide by that sum:
+$$
+p\ge \frac{C_{10}}{C_{10}+C_{01}}.
+$$
+The cut that minimises expected cost is therefore $c=C_{10}/(C_{10}+C_{01})$. The tables below use $c=0.5$ and $c=\bar y_{\mathrm{train}}$. They do not estimate $C_{10}$ or $C_{01}$.
+
+**Calibration.** `calibration_df()` in `02_assess_network.R` splits $\mathcal{I}_{\mathrm{test}}$ into bins of $\hat p$. Bin $b$ has index set $\mathcal{B}_b$ and size $n_{\mathcal{B}_b}=|\mathcal{B}_b|$. The function plots $\overline{\hat p}_b=n_{\mathcal{B}_b}^{-1}\sum_{i\in\mathcal{B}_b}\hat p_i$ against $\bar y_b=n_{\mathcal{B}_b}^{-1}\sum_{i\in\mathcal{B}_b} y_i$. If $\hat p_i=P(Y_i=1\mid\mathbf{x}_i)$, then $E[\bar y_b\mid \{\hat p_i:i\in\mathcal{B}_b\}]=\overline{\hat p}_b$.
+
+**Profile.** `base_row` is one training row in which every numeric covariate is set to its training median and every factor to its training mode. `make_profile()` repeats that row once per value in `tenure_seq`, then overwrites `Contract`, `tenure`, and `TotalCharges`:
+
+```r
+make_profile <- function(contract, tenure_seq = 0:72) {
+  out <- base_row[rep(1, length(tenure_seq)), ]
+  out$Contract <- factor(contract, levels = levels(telco_train$Contract))
+  out$tenure <- tenure_seq
+  out$TotalCharges <- out$tenure * out$MonthlyCharges
+  out
+}
+nn_prof <- rbind(make_profile("Month-to-month"), make_profile("Two year"))
+```
+
+The plotted curves are $\hat p$ as a function of tenure, one curve for each of those two values of `Contract`. Every other covariate stays at the value in `base_row`. The network is scored on the scaled copy of `nn_prof`; the linear probability model and the GLM are scored on `nn_prof` itself:
+
+```r
+nn_prof_scaled <- apply_center_scale(as_churn_factor(nn_prof), nn_spec)
+nn_prof$neural_network <- nnet_probability(nn_fit, nn_prof_scaled)
+nn_prof$linear_probability <- as.numeric(predict(lpm, newdata = nn_prof))
+nn_prof$logistic <- as.numeric(predict(logit_mod, newdata = nn_prof, type = "response"))
+```
+
+```{r}
+#| label: assess-network
+#| fig-cap:
+#|   - "Validation Brier B_val(H, lambda). The open circle is (H*, lambda*)."
+#|   - "Test-set values of p-hat(H*, lambda*)."
+#|   - "Test ROC of the network. The area is the AUC."
+#|   - "Test calibration: mean y in a bin of p-hat against the mean p-hat."
+#|   - "Profile: p-hat against tenure at two contracts, other covariates fixed at a typical training row."
+source(here("R", "neural_network", "02_assess_network.R"))
+```
+
+## What the test numbers say
+
+On $\mathcal{I}_{\mathrm{test}}$, $B_{\mathcal{I}_{\mathrm{test}}}=`r num4(nn_holdout$test[nn_holdout$metric == "Brier"])`$. On $\mathcal{I}_{\mathrm{train}}$, $B_{\mathcal{I}_{\mathrm{train}}}=`r num4(nn_holdout$train[nn_holdout$metric == "Brier"])`$. On $\mathcal{I}_{\mathrm{test}}$, $L_{\mathcal{I}_{\mathrm{test}}}=`r num4(nn_holdout$test[nn_holdout$metric == "Log loss"])`$; on $\mathcal{I}_{\mathrm{train}}$, $L_{\mathcal{I}_{\mathrm{train}}}=`r num4(nn_holdout$train[nn_holdout$metric == "Log loss"])`$. On $\mathcal{I}_{\mathrm{test}}$, $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}=`r num3(nn_holdout$test[nn_holdout$metric == "AUC"])`$; on $\mathcal{I}_{\mathrm{train}}$, $\mathrm{AUC}_{\mathcal{I}_{\mathrm{train}}}=`r num3(nn_holdout$train[nn_holdout$metric == "AUC"])`$.
+
+Every value of $\hat p(H^\star,\lambda^\star)$ on $\mathcal{I}_{\mathrm{test}}$ lies in $(0,1)$, from $`r num4(min(nn_test_p))`$ to $`r num4(max(nn_test_p))`$, because $\hat p_i=\sigma(\eta_i)$.
+
+The churn rate on $\mathcal{I}_{\mathrm{test}}$ is $`r num3(mean(nn_y_test))`$. The rule $\hat Y_i=0$ for every $i\in\mathcal{I}_{\mathrm{test}}$ has accuracy $`r num3(mean(nn_y_test == 0))`$. At $c=0.5$, $\mathrm{Acc}=`r num3(nn_confusion$accuracy[1])`$, $\mathrm{Sens}=`r num3(nn_confusion$sensitivity[1])`$, $\mathrm{Spec}=`r num3(nn_confusion$specificity[1])`$, $\mathrm{Prec}=`r num3(nn_confusion$precision[1])`$. $\mathrm{Sens}=`r num3(nn_confusion$sensitivity[1])`$ is the fraction of test churners with $\hat p_i\ge 1/2$. At $c=\bar y_{\mathrm{train}}=`r num3(mean(telco_train$Churn))`$, $\mathrm{Sens}=`r num3(nn_confusion$sensitivity[2])`$, $\mathrm{Spec}=`r num3(nn_confusion$specificity[2])`$, and $\mathrm{Acc}=`r num3(nn_confusion$accuracy[2])`$.
+
+`nnet` does not return a standard error for $w_{hj}^{(1)}$. In $\hat p^{\mathrm{GLM}}$, the log-odds coefficient of a two-year contract, with the other covariates held fixed, is the corresponding $\beta_j$, and the odds ratio is $e^{\beta_j}$.
+
+# Three scores on one test set
+
+The comparison reads $\hat p^{\mathrm{LPM}}$, $\hat p^{\mathrm{GLM}}$, and $\hat p(H^\star,\lambda^\star)$ on $\mathcal{I}_{\mathrm{test}}$. Those three vectors are
+
+```r
+lpm_test_p <- as.numeric(predict(lpm, newdata = telco_test))
+logit_test_p <- as.numeric(predict(logit_mod, newdata = telco_test, type = "response"))
+nn_test_p <- nnet_probability(nn_fit, nn_test_scaled)
+```
+
+`save_test_predictions()` stores each one as the field `p`. `00_export_linear_logistic.R` writes the first two, and `05_assessment.R` writes them again with the same `method_id`. `01_fit_network.R` writes the third.
+
+| File | Vector | `p` |
+| --- | --- | --- |
+| `output/test_predictions/01_linear_probability.rds` | $\hat p^{\mathrm{LPM}}$ | `lpm_test_p` |
+| `output/test_predictions/02_logistic.rds` | $\hat p^{\mathrm{GLM}}$ | `logit_test_p` |
+| `output/test_predictions/03_neural_network.rds` | $\hat p(H^\star,\lambda^\star)$ | `nn_test_p` |
+
+`R/compare_methods/01_compare_on_test.R` loads every `*.rds` in that folder. For each file it checks that `test_row` is the same set and that $y$ agrees, then computes $B_{\mathcal{I}_{\mathrm{test}}}$, $L_{\mathcal{I}_{\mathrm{test}}}$, $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}$, and the confusion tables at $c=0.5$ and at $c=\bar y_{\mathrm{train}}$. A further method is another file on those same rows.
+
+## What a file must contain
+
+`save_test_predictions()` in `R/compare_methods/prediction_io.R` checks the object and writes `output/test_predictions/<method_id>.rds`. The fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `method_id` | File name, letters, digits, and underscores. Lexical order is the table order, which is why the ids start with `01_`, `02_`, `03_`. |
+| `method_label` | Name on the figures. |
+| `detail` | One line describing the fit. |
+| `y` | Observed churn, $0/1$, on the test rows. |
+| `p` | Score for those rows. Larger means "more likely to churn". Brier, log loss, and calibration treat it as $P(Y=1)$. |
+| `test_row` | Row numbers in the prepared `telco` frame (`test_id` from the seed-$2026$ split). |
+| `split` | `seed`, `test_frac`, `n_rows`, `n_train`, `train_prevalence`. |
+
+The loader sorts by `test_row`, so a later method may save the customers in a different order. It then checks that every file has the same row set, the same outcomes, and the same split description. A file that was scored on a different hold-out stops the program.
+
+```{r}
+#| label: compare-methods
+#| fig-cap:
+#|   - "ROC curves on the shared test set."
+#|   - "Calibration on the shared test set. A linear-probability bin can have a negative mean prediction."
+#|   - "Test-set Brier score with a 95% percentile bootstrap interval. The dashed line is a constant forecast at the training churn rate."
+source(here("R", "compare_methods", "00_export_linear_logistic.R"))
+source(here("R", "compare_methods", "01_compare_on_test.R"))
+```
+
+```{r}
+#| label: name-the-gaps
+score_of <- function(label) {
+  comparison_scores[comparison_scores$method_label == label, ]
+}
+gap_of <- function(a, b) {
+  hit <- comparison_brier_diff$method_a == a & comparison_brier_diff$method_b == b
+  comparison_brier_diff[hit, ]
+}
+lpm_row <- score_of("Linear probability")
+logit_row <- score_of("Logistic regression")
+nn_row <- score_of("Neural network")
+gap_lpm_logit <- gap_of("Linear probability", "Logistic regression")
+gap_lpm_nn <- gap_of("Linear probability", "Neural network")
+gap_logit_nn <- gap_of("Logistic regression", "Neural network")
+```
+
+## Reading the three scores
+
+On the $n_{\mathrm{test}}$ rows in $\mathcal{I}_{\mathrm{test}}$, write $B_{\mathrm{test}}(m)=B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{(m)})$ and write $B_0=B_{\mathcal{I}_{\mathrm{test}}}(\bar y_{\mathrm{train}})$ for the constant forecast. The skill is $1-B_{\mathrm{test}}(m)/B_0$. The paired difference is
+$$
+\Delta(m,m')=\frac{1}{n_{\mathrm{test}}}\sum_{i\in\mathcal{I}_{\mathrm{test}}}\Big[\big(\hat p_i^{(m)}-y_i\big)^2-\big(\hat p_i^{(m')}-y_i\big)^2\Big].
+$$
+$\Delta(m,m')>0$ means $m$ has the larger $B_{\mathrm{test}}$. The interval is the $2.5\%$ and $97.5\%$ quantiles of $\Delta$ over $2000$ resamples of $\mathcal{I}_{\mathrm{test}}$. The indices are drawn once and reused for every method:
+
+```r
+set.seed(2028)
+B <- 2000L
+boot_idx <- replicate(B, sample.int(n_test, n_test, replace = TRUE))
+se_diff <- (methods[[i]]$p - y_test)^2 - (methods[[j]]$p - y_test)^2
+boot <- colMeans(matrix(se_diff[boot_idx], nrow = n_test))
+ci <- quantile(boot, c(0.025, 0.975), names = FALSE)
+```
+
+Here `B` is the number of resamples. The Brier scores are $B_{\mathcal{S}}$ and $B_{\mathrm{test}}$, not this object. The three fitted vectors stay fixed: each resample redraws rows of $\mathcal{I}_{\mathrm{test}}$ and does not refit $\mathbf{w}$ or $\boldsymbol{\beta}$.
+
+There are $`r n_test`$ shared test customers. The training prevalence stored in the files is $`r num3(train_prevalence)`$. $B_0=`r num4(brier_ref)`$ and the constant-forecast log loss is $`r num4(log_loss_ref)`$. Always predicting "stay" has accuracy $`r num3(mean(y_test == 0))`$.
+
+| | Linear probability | Logistic regression | Neural network |
+| --- | --- | --- | --- |
+| Scores outside $[0,1]$ | `r lpm_row$n_outside_01` | `r logit_row$n_outside_01` | `r nn_row$n_outside_01` |
+| Brier | `r num4(lpm_row$brier)` | `r num4(logit_row$brier)` | `r num4(nn_row$brier)` |
+| Brier, $95\%$ bootstrap interval | `r num4(lpm_row$brier_ci_low)` to `r num4(lpm_row$brier_ci_high)` | `r num4(logit_row$brier_ci_low)` to `r num4(logit_row$brier_ci_high)` | `r num4(nn_row$brier_ci_low)` to `r num4(nn_row$brier_ci_high)` |
+| Skill against the constant forecast | `r num3(lpm_row$brier_skill)` | `r num3(logit_row$brier_skill)` | `r num3(nn_row$brier_skill)` |
+| Log loss | `r num4(lpm_row$log_loss)` | `r num4(logit_row$log_loss)` | `r num4(nn_row$log_loss)` |
+| AUC (DeLong interval) | `r num3(lpm_row$auc)` (`r num3(lpm_row$auc_ci_low)`–`r num3(lpm_row$auc_ci_high)`) | `r num3(logit_row$auc)` (`r num3(logit_row$auc_ci_low)`–`r num3(logit_row$auc_ci_high)`) | `r num3(nn_row$auc)` (`r num3(nn_row$auc_ci_low)`–`r num3(nn_row$auc_ci_high)`) |
+
+Skill $1-B_{\mathrm{test}}(m)/B_0$ is positive for all three rows of the table. The DeLong intervals for the three values of $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}$ overlap.
+
+- $\Delta(\hat p^{\mathrm{LPM}},\hat p^{\mathrm{GLM}})=`r num4(gap_lpm_logit$brier_a_minus_b)`$, interval $`r num4(gap_lpm_logit$ci_low)`$ to $`r num4(gap_lpm_logit$ci_high)`$.
+- $\Delta(\hat p^{\mathrm{LPM}},\hat p(H^\star,\lambda^\star))=`r num4(gap_lpm_nn$brier_a_minus_b)`$, interval $`r num4(gap_lpm_nn$ci_low)`$ to $`r num4(gap_lpm_nn$ci_high)`$.
+- $\Delta(\hat p^{\mathrm{GLM}},\hat p(H^\star,\lambda^\star))=`r num4(gap_logit_nn$brier_a_minus_b)`$, interval $`r num4(gap_logit_nn$ci_low)`$ to $`r num4(gap_logit_nn$ci_high)`$.
+
+The interval for $\Delta(\hat p^{\mathrm{GLM}},\hat p(H^\star,\lambda^\star))$ contains $0$.
+
+$L_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{LPM}})$ is computed after clipping those $`r lpm_row$n_outside_01`$ scores to $(10^{-6},1-10^{-6})$. $B_{\mathrm{test}}(\hat p^{\mathrm{LPM}})$ uses the unclipped scores.
+
+At $c=0.5$, accuracy is $`r num3(lpm_row$accuracy_05)`$, $`r num3(logit_row$accuracy_05)`$, and $`r num3(nn_row$accuracy_05)`$. The constant rule $\hat Y_i=0$ has accuracy $`r num3(mean(y_test == 0))`$. Sensitivity at $c=0.5$ is $`r num3(lpm_row$sensitivity_05)`$, $`r num3(logit_row$sensitivity_05)`$, and $`r num3(nn_row$sensitivity_05)`$. At $c=\bar y_{\mathrm{train}}$, sensitivity is $`r num3(lpm_row$sensitivity_prevalence)`$, $`r num3(logit_row$sensitivity_prevalence)`$, and $`r num3(nn_row$sensitivity_prevalence)`$, and specificity is $`r num3(lpm_row$specificity_prevalence)`$, $`r num3(logit_row$specificity_prevalence)`$, and $`r num3(nn_row$specificity_prevalence)`$, in the same order: linear probability, logistic regression, network.
+
+The bootstrap draws one resample of $\mathcal{I}_{\mathrm{test}}$ and recomputes both scores on it. For the sampling variance of that difference,
+$$
+\mathrm{Var}\big(\Delta(m,m')\big)
+=\mathrm{Var}\big(B_{\mathrm{test}}(m)\big)+\mathrm{Var}\big(B_{\mathrm{test}}(m')\big)-2\mathrm{Cov}\big(B_{\mathrm{test}}(m),B_{\mathrm{test}}(m')\big).
+$$
+The same $y_i$ enter $B_{\mathrm{test}}(m)$ and $B_{\mathrm{test}}(m')$, so the covariance need not be zero. The intervals for $B_{\mathrm{test}}(\hat p^{\mathrm{LPM}})$, $B_{\mathrm{test}}(\hat p^{\mathrm{GLM}})$, and $B_{\mathrm{test}}(\hat p(H^\star,\lambda^\star))$ can overlap while the interval for $\Delta$ excludes $0$.
+
+# Adding another classification method
+
+`01_compare_on_test.R` loads every file in `output/test_predictions/`. `known_colours` in that file sets the colours of the labels "Linear probability", "Logistic regression", and "Neural network". Any other `method_label` receives the next entry of `extra_colours`. A fourth method needs a fit on `telco_train` from `R/01_prepare_data.R`, predictions on `telco_test`, and the calls below. `p_hat` in the listing is the vector of scores on `telco_test`.
+
+```r
+source("R/01_prepare_data.R")
+source("R/compare_methods/prediction_io.R")
+
+# p_hat: P(Churn = 1) on telco_test, same customers as test_id.
+save_test_predictions(
+  method_id = "04_my_method",
+  method_label = "My method",
+  y = telco_test$Churn,
+  p = p_hat,
+  test_row = test_id,
+  split = churn_split_info(telco, telco_train),
+  detail = "one line on what was fit"
+)
+
+source("R/compare_methods/01_compare_on_test.R")
+```
+
+`method_id` is the file name `04_my_method.rds`. Ids sort in lexical order, so the prefix `04_` places this file after `01_`, `02_`, and `03_`. `method_label` is the legend text. `load_test_predictions()` rejects a file whose $y$ or whose set of `test_row` differs from the files already saved. $B_{\mathcal{I}_{\mathrm{test}}}$, $L_{\mathcal{I}_{\mathrm{test}}}$, and `calibration_df()` use $p$ as $P(Y=1)$. $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}$ depends on $p$ only through the order of the scores. If some $p_i\notin[0,1]$, `n_outside_01` counts them.
+
+Nothing in `R/compare_methods/01_compare_on_test.R` is edited when a file is added. Each run rewrites `comparison_scores.csv`, `comparison_classes.csv`, and `comparison_brier_diff.csv` in `output/test_predictions/`.
+
+# Reproducing
+
+From the project root, with `churn-decision.Rproj` as the working directory:
+
+```r
+source("R/compare_methods/00_export_linear_logistic.R")
+source("R/neural_network/00_run_all.R")
+source("R/compare_methods/01_compare_on_test.R")
+```
+
+Or render this file:
+
+```bash
+quarto render neural-network-churn.qmd
+```
+
+| Path | Content |
+| --- | --- |
+| `R/neural_network/nn_lib.R` | Scaling, one `nnet` start, the validation search, the final refit |
+| `R/neural_network/01_fit_network.R` | Run the search on the shared split and save the test scores |
+| `R/neural_network/02_assess_network.R` | Train/test scores, confusion table, figures, profile |
+| `R/neural_network/00_run_all.R` | Source the fit and the assessment |
+| `R/compare_methods/prediction_io.R` | `save_test_predictions()` and `load_test_predictions()` |
+| `R/compare_methods/00_export_linear_logistic.R` | Refit `lm` and `glm` and save their test scores |
+| `R/compare_methods/01_compare_on_test.R` | Load every saved method and compare them |
+| `R/05_assessment.R` | The original hold-out checks; also writes the linear and logistic score files |
+
+Packages to have installed: `nnet`, `here`, `dplyr`, `ggplot2`, `tidyr`, `pROC`. The first of these ships with R. The others are the same CRAN libraries as the logistic note, minus `broom`, `car`, `lmtest`, and `scales`, which this network fit does not call.
