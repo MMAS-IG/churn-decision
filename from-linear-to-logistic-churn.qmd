@@ -843,3 +843,5 @@ source("R/00_run_all.R")
 | `R/05_assessment.R` | Test-set confusion tables, Brier, ROC, calibration, influence |
 
 Packages used: `here`, `dplyr`, `ggplot2`, `tidyr`, `scales`, `broom`, `car`, `lmtest`, `pROC`. All of them are ordinary CRAN libraries; `stats::lm` and `stats::glm` do the estimation.
+
+The same split is reused for a single-hidden-layer network in [`neural-network-churn.qmd`](neural-network-churn.qmd). `R/05_assessment.R` writes the test-set scores of the linear probability model and of the logistic regression to `output/test_predictions/`, and `R/compare_methods/01_compare_on_test.R` reads those files together with any later method scored on the same rows.

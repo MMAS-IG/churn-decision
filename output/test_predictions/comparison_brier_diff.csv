@@ -1,0 +1,4 @@
+"method_a","method_b","brier_a_minus_b","ci_low","ci_high"
+"Linear probability","Logistic regression",0.00467745896885663,0.00281171571584539,0.00664560148378595
+"Linear probability","Neural network",0.00543777951473434,0.00323043744992357,0.0075069815882353
+"Logistic regression","Neural network",0.000760320545877713,-0.000140355658865693,0.00166578661498031

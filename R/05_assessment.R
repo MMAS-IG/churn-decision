@@ -176,3 +176,26 @@ p_cook <- ggplot(data.frame(i = seq_along(cooks), cook = cooks), aes(x = i, y = 
   )
 print(p_cook)
 ggsave(here::here("figures", "logit_cooks.png"), p_cook, width = 7, height = 4.5)
+
+# Persist the two test-set score vectors for R/compare_methods/01_compare_on_test.R.
+# The same files are written by R/compare_methods/00_export_linear_logistic.R.
+source(here::here("R", "compare_methods", "prediction_io.R"))
+split_info <- churn_split_info(telco, telco_train)
+save_test_predictions(
+  method_id = "01_linear_probability",
+  method_label = "Linear probability",
+  y = y_test,
+  p = lpm_test_p,
+  test_row = test_id,
+  split = split_info,
+  detail = "OLS linear probability model"
+)
+save_test_predictions(
+  method_id = "02_logistic",
+  method_label = "Logistic regression",
+  y = y_test,
+  p = logit_test_p,
+  test_row = test_id,
+  split = split_info,
+  detail = "Binomial GLM, logit link"
+)
