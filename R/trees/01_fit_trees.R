@@ -65,76 +65,120 @@ rownames(tree_selection) <- NULL
 tree_chosen <- tree_selection[1, ]
 
 # --- bagging: one forest on all training rows, OOB path in M -------------
-
+# OTTIMIZZAZIONE GRUPPO 4: Inserito nodesize per limitare la profondità
 bag_ntree <- 500L
-set.seed(31000)
-bag_fit <- randomForest(
-  Churn ~ .,
-  data = train_fac,
-  ntree = bag_ntree,
-  mtry = p_cov,
-  replace = TRUE,
-  sampsize = nrow(train_fac),
-  keep.inbag = TRUE,
-  importance = FALSE
-)
-bag_oob_path <- oob_vote_share_path(bag_fit, train_fac)
-bag_path <- data.frame(
-  M = seq_len(bag_ntree),
-  mtry = p_cov,
-  oob_brier = brier_along_oob(bag_oob_path, y_train)
-)
-bag_path <- bag_path[order(bag_path$oob_brier, bag_path$M), ]
+bag_nodesize_grid <- c(1L, 10L, 50L) 
+bag_path_list <- list()
+bag_fit_store <- list()
+bag_oob_store <- list()
+
+for (i in seq_along(bag_nodesize_grid)) {
+  n_size <- bag_nodesize_grid[[i]]
+  set.seed(31000L + n_size)
+  message("Bagging tuning nodesize = ", n_size)
+  
+  fit_bag <- randomForest(
+    Churn ~ .,
+    data = train_fac,
+    ntree = bag_ntree,
+    mtry = p_cov,             # Bagging: mtry è fisso a 19 (tutte le variabili)
+    nodesize = n_size,        # Il nostro nuovo parametro
+    replace = TRUE,
+    sampsize = nrow(train_fac),
+    keep.inbag = TRUE,
+    importance = FALSE
+  )
+  
+  oob_path_bag <- oob_vote_share_path(fit_bag, train_fac)
+  bag_fit_store[[as.character(n_size)]] <- fit_bag
+  bag_oob_store[[as.character(n_size)]] <- oob_path_bag
+  
+  bag_path_list[[i]] <- data.frame(
+    M = seq_len(bag_ntree),
+    mtry = p_cov,
+    nodesize = n_size,
+    oob_brier = brier_along_oob(oob_path_bag, y_train)
+  )
+}
+
+bag_path <- do.call(rbind, bag_path_list)
+bag_path <- bag_path[order(bag_path$oob_brier, bag_path$M, bag_path$nodesize), ]
 rownames(bag_path) <- NULL
 bag_chosen <- bag_path[1, ]
-bag_chosen$oob_brier_se <- brier_se_defined(
-  y_train, bag_oob_path[, bag_chosen$M]
-)
+
+# Estrai il modello vincente per il Bagging
+bag_fit <- bag_fit_store[[as.character(bag_chosen$nodesize)]]
+bag_oob_path <- bag_oob_store[[as.character(bag_chosen$nodesize)]]
+
+bag_chosen$oob_brier_se <- brier_se_defined(y_train, bag_oob_path[, bag_chosen$M])
 bag_oob_p <- bag_oob_path[, bag_chosen$M]
 bag_train_p <- vote_share_at(bag_fit, train_fac, bag_chosen$M)
 bag_test_p <- vote_share_at(bag_fit, test_fac, bag_chosen$M)
 
-# --- random forest: m_try < p, same OOB vote share -----------------------
 
-rf_mtry_grid <- c(2L, 4L, 6L, 8L, 12L)
+# --- random forest: m_try < p, same OOB vote share -----------------------
+# OTTIMIZZAZIONE GRUPPO 4: Griglia incrociata mtry x nodesize
+
+rf_mtry_grid <- c(2L, 4L, 6L, 8L, 12L, 15L) # Aggiunto 15 per criticare il range
+rf_nodesize_grid <- c(1L, 10L, 50L)         # Griglia profondità
 rf_ntree <- 500L
-rf_path_list <- vector("list", length(rf_mtry_grid))
-rf_oob_by_mtry <- list()
-rf_fit_by_mtry <- list()
-for (i in seq_along(rf_mtry_grid)) {
-  mtry <- rf_mtry_grid[[i]]
-  set.seed(32000L + mtry)
-  message("Forest tuning mtry = ", mtry, ", ntree = ", rf_ntree)
+
+# expand.grid crea tutte le combinazioni possibili tra i due parametri
+rf_grid <- expand.grid(mtry = rf_mtry_grid, nodesize = rf_nodesize_grid)
+
+rf_path_list <- vector("list", nrow(rf_grid))
+rf_oob_store <- list()
+rf_fit_store <- list()
+
+for (i in seq_len(nrow(rf_grid))) {
+  mtry_val <- rf_grid$mtry[i]
+  n_size_val <- rf_grid$nodesize[i]
+  
+  set.seed(32000L + mtry_val + n_size_val)
+  message("Forest tuning mtry = ", mtry_val, ", nodesize = ", n_size_val)
+  
   fit_m <- randomForest(
     Churn ~ .,
     data = train_fac,
     ntree = rf_ntree,
-    mtry = mtry,
+    mtry = mtry_val,
+    nodesize = n_size_val,
     replace = TRUE,
     sampsize = nrow(train_fac),
     keep.inbag = TRUE,
     importance = TRUE
   )
+  
   oob_path <- oob_vote_share_path(fit_m, train_fac)
-  rf_oob_by_mtry[[as.character(mtry)]] <- oob_path
-  rf_fit_by_mtry[[as.character(mtry)]] <- fit_m
+  
+  # Salviamo usando una chiave combinata "mtry_nodesize"
+  key <- paste(mtry_val, n_size_val, sep = "_")
+  rf_oob_store[[key]] <- oob_path
+  rf_fit_store[[key]] <- fit_m
+  
   rf_path_list[[i]] <- data.frame(
     M = seq_len(rf_ntree),
-    mtry = mtry,
+    mtry = mtry_val,
+    nodesize = n_size_val,
     oob_brier = brier_along_oob(oob_path, y_train)
   )
 }
+
 rf_path <- do.call(rbind, rf_path_list)
-rownames(rf_path) <- NULL
-rf_ranked <- rf_path[order(rf_path$oob_brier, rf_path$M, rf_path$mtry), ]
+# Ordina per Brier score per trovare il vincitore assoluto
+rf_ranked <- rf_path[order(rf_path$oob_brier, rf_path$M, rf_path$mtry, rf_path$nodesize), ]
 rownames(rf_ranked) <- NULL
 rf_chosen <- rf_ranked[1, ]
-rf_fit <- rf_fit_by_mtry[[as.character(rf_chosen$mtry)]]
-rf_oob_p <- rf_oob_by_mtry[[as.character(rf_chosen$mtry)]][, rf_chosen$M]
+
+# Estrai il modello vincente per la Random Forest
+best_key <- paste(rf_chosen$mtry, rf_chosen$nodesize, sep = "_")
+rf_fit <- rf_fit_store[[best_key]]
+rf_oob_p <- rf_oob_store[[best_key]][, rf_chosen$M]
+
 rf_chosen$oob_brier_se <- brier_se_defined(y_train, rf_oob_p)
 rf_train_p <- vote_share_at(rf_fit, train_fac, rf_chosen$M)
 rf_test_p <- vote_share_at(rf_fit, test_fac, rf_chosen$M)
-rf_fit_by_mtry <- NULL
+rf_fit_store <- NULL
 
 # --- boosting: bernoulli loss, grid of depth and shrinkage ---------------
 
@@ -199,8 +243,10 @@ message("Chosen tree cp = ", signif(tree_chosen$cp, 4),
         ", leaves = ", tree_chosen$n_leaf,
         ", validation Brier = ", round(tree_chosen$val_brier, 4))
 message("Chosen bagging M = ", bag_chosen$M,
+        ", nodesize = ", bag_chosen$nodesize,
         ", OOB Brier = ", round(bag_chosen$oob_brier, 4))
 message("Chosen forest mtry = ", rf_chosen$mtry,
+        ", nodesize = ", rf_chosen$nodesize,
         ", M = ", rf_chosen$M,
         ", OOB Brier = ", round(rf_chosen$oob_brier, 4))
 message("Chosen boosting depth = ", boost_chosen$depth,
@@ -265,10 +311,11 @@ save_test_predictions(
   test_row = test_id,
   split = split_info,
   detail = sprintf(
-    "randomForest mtry %d, %d trees, vote share",
-    p_cov, bag_chosen$M
+    "bagging mtry %d, nodesize %d, %d trees",
+    p_cov, bag_chosen$nodesize, bag_chosen$M
   )
 )
+
 save_test_predictions(
   method_id = "06_random_forest",
   method_label = "Random forest",
@@ -277,8 +324,8 @@ save_test_predictions(
   test_row = test_id,
   split = split_info,
   detail = sprintf(
-    "randomForest mtry %d, %d trees, vote share",
-    rf_chosen$mtry, rf_chosen$M
+    "randomForest mtry %d, nodesize %d, %d trees",
+    rf_chosen$mtry, rf_chosen$nodesize, rf_chosen$M
   )
 )
 save_test_predictions(
@@ -308,9 +355,18 @@ print(
   bag_path_plot[bag_path_plot$M %in% c(1L, 50L, 100L, 250L, 500L), ],
   digits = 4, row.names = FALSE
 )
-rf_best_by_mtry <- do.call(rbind, lapply(split(rf_path, rf_path$mtry), function(d) {
-  d[order(d$oob_brier, d$M), ][1, ]
-}))
+# Estrai la migliore prestazione per OGNI combinazione di (mtry, nodesize)
+rf_best_by_pair <- do.call(rbind, lapply(
+  split(rf_path, interaction(rf_path$mtry, rf_path$nodesize, drop = TRUE)),
+  function(d) d[order(d$oob_brier, d$M), ][1, ]
+))
+
+# Ordina la tabella finale prima per mtry e poi per nodesize
+rf_best_by_pair <- rf_best_by_pair[order(rf_best_by_pair$mtry, rf_best_by_pair$nodesize), ]
+rownames(rf_best_by_pair) <- NULL
+
+cat("Best M inside each (mtry, nodesize), by out-of-bag Brier:\n")
+print(rf_best_by_pair, digits = 4, row.names = FALSE)
 cat("Best M inside each mtry, by out-of-bag Brier:\n")
 print(rf_best_by_mtry, digits = 4, row.names = FALSE)
 boost_best_by_pair <- do.call(rbind, lapply(
