@@ -1,0 +1,509 @@
+---
+title: "Trees, bagging, random forests, and boosting for customer churn"
+subtitle: "The same IBM Telco split, then a comparison with the linear, logistic, and network scores"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    theme: cosmo
+    html-math-method: katex
+    fig-width: 7.5
+    fig-height: 4.8
+    fig-dpi: 120
+knitr:
+  opts_chunk:
+    comment: "#>"
+    message: false
+    warning: false
+    fig.path: "figures/"
+execute:
+  echo: true
+---
+
+```{r}
+#| label: setup
+library(here)
+library(dplyr)
+library(ggplot2)
+library(rpart)
+library(randomForest)
+library(gbm)
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 999)
+num4 <- function(x) sprintf("%.4f", as.numeric(x))
+num3 <- function(x) sprintf("%.3f", as.numeric(x))
+dir.create(here("figures"), showWarnings = FALSE)
+dir.create(here("output", "test_predictions"), showWarnings = FALSE)
+```
+
+This note fits four classifiers to the same churn table, and the same $70/30$ split, as [`from-linear-to-logistic-churn.qmd`](from-linear-to-logistic-churn.qmd) and [`neural-network-churn.qmd`](neural-network-churn.qmd). The outcome is `Churn`. The predictors are every other column except `customerID`. The four scores are then read on the held-out customers together with the linear probability model, the logistic regression, and the neural network.
+
+# Packages
+
+## `rpart`: one classification tree
+
+[`rpart`](https://cran.r-project.org/package=rpart) (Therneau, Atkinson, and Ripley) fits a CART tree. It is a recommended package, so a standard R installation already contains it. The classification call used here is `rpart(Churn ~ ., data, method = "class")`.
+
+| Argument | Role |
+|------------------------------------|------------------------------------|
+| `method = "class"` | The leaf stores a class probability. The default split criterion is the Gini index. |
+| `control = rpart.control(cp, xval, minsplit, minbucket)` | `cp` is the cost-complexity parameter. `xval` is the number of folds in rpart's own cross-validation. `minsplit` (default $20$) is the smallest node that may be split. `minbucket` (default $\lfloor \mathtt{minsplit}/3 \rfloor$) is the smallest leaf. |
+| `predict(..., type = "prob")` | A matrix with one column per class. The column `Yes` is the leaf relative frequency of churn. |
+
+`prune(fit, cp)` returns the subtree on the cost-complexity path at that value of `cp`. `plot(fit); text(fit)` draws the tree with base graphics. This note uses `rpart.plot::rpart.plot()` for that drawing. `rpart.plot` is a separate package.
+
+## `randomForest`: bagging and random forests
+
+[`randomForest`](https://cran.r-project.org/package=randomForest) (Liaw and Wiener, from Breiman and Cutler's Fortran) grows a forest of classification trees.
+
+| Argument | Role |
+|------------------------------------|------------------------------------|
+| `ntree` | Number of trees. The object stores every tree, so a vote share after $M\le \mathtt{ntree}$ trees is a prefix of one fit. |
+| `mtry` | Number of covariates tried at each split. The default for classification is $\lfloor \sqrt{q} \rfloor$, where $q$ is the number of covariates. |
+| `nodesize` | Smallest leaf. The classification default is $1$, so a tree is grown until every leaf is pure or no legal split remains. |
+| `replace`, `sampsize` | Defaults: a bootstrap sample of size equal to the number of rows passed to `randomForest`. |
+| `importance = TRUE` | Store the permutation importance $I_j$ and the Gini decrease. $I_j$ is defined in the next paragraph. |
+| `predict(..., type = "prob")` | Fraction of trees that vote `Yes`. |
+| `predict(..., predict.all = TRUE)` | That fraction, and the class vote of every tree. |
+
+`set.seed` before `randomForest` fixes the bootstrap samples and the covariates tried at each split.
+
+`importance = TRUE` stores two summaries for each covariate $j$. The Gini decrease adds up the Gini improvements at the splits that use $j$. The other summary is a permutation importance, and it uses only out-of-bag rows. Tree $b$ is grown on a bootstrap sample. Write $T_b(\mathbf{x})$ for the class voted by tree $b$ at $\mathbf{x}$, and write $O_b$ for the rows of the data passed to `randomForest` that this sample does not contain. Let $e_b$ be the misclassification rate of tree $b$ on $O_b$: $$
+e_b=\frac{1}{|O_b|}\sum_{i\in O_b}\mathbf{1}\{T_b(\mathbf{x}_i)\ne Y_i\}.
+$$ Permuting covariate $j$ means drawing a permutation of the values of covariate $j$ on the rows in $O_b$, and leaving every other covariate as it is. Let $\mathbf{x}_i^{(j)}$ be row $i$ after that replacement. Let $e_{b,j}$ be the misclassification rate of the same tree after that replacement: $$
+e_{b,j}=\frac{1}{|O_b|}\sum_{i\in O_b}\mathbf{1}\{T_b(\mathbf{x}_i^{(j)})\ne Y_i\}.
+$$ The increase $e_{b,j}-e_b$ is the rise in misclassification relative to the unpermuted out-of-bag rows of tree $b$. With $\mathtt{ntree}$ the number of trees stored in the fitted object, the stored permutation importance is the average of those increases, $$
+I_j=\frac{1}{\mathtt{ntree}}\sum_{b=1}^{\mathtt{ntree}}(e_{b,j}-e_b).
+$$ `importance(fit, scale = FALSE)[, "MeanDecreaseAccuracy"]` returns $I_j$ when the call sets `importance = TRUE`. The Gini column `MeanDecreaseGini` is stored for every forest, including a fit with `importance = FALSE`. It is written $\mathrm{Gini}_j$ in the random-forest section. On this sample the sets $O_b$ are the training rows left out of each bootstrap sample; that construction is written in the bagging section.
+
+## `gbm`: gradient boosting
+
+[`gbm`](https://cran.r-project.org/package=gbm) (Greenwell, Boehmke, Cunningham, and developers, from Friedman's gradient boosting) adds regression trees one at a time to the logit of the churn probability. For a real number $t$, $$
+\sigma(t)=\frac{e^{t}}{1+e^{t}}.
+$$ After $m$ trees the fit is a real-valued function $F_m$. The boosting section writes the recursion for $F_m$. The value $\sigma(F_m(\mathbf{x}))$ is the predicted probability of churn at covariates $\mathbf{x}$.
+
+| Argument | Role |
+|------------------------------------|------------------------------------|
+| `distribution = "bernoulli"` | The loss is the Bernoulli negative log-likelihood. The response must be numeric $0/1$. |
+| `n.trees` | Number of trees added. `predict(..., n.trees = m, type = "response")` returns $\sigma(F_m(\mathbf{x}))$. |
+| `interaction.depth` | Number of splits in each tree. The value $1$ means each tree uses one covariate. |
+| `shrinkage` | The multiplier $\nu$ of each new tree. |
+| `bag.fraction` | Fraction of the fitting rows drawn, without replacement, for each tree. This note fixes it at $0.5$. |
+| `n.minobsinnode` | Smallest leaf. This note fixes it at $10$. |
+| `cv.folds` | gbm's own cross-validation. Set to $0$ here. The validation slice defined below chooses the tuning constants. |
+
+## Packages that fit the same models and are not called
+
+-   [`ipred`](https://cran.r-project.org/package=ipred) `bagging()` averages `rpart` class probabilities over bootstrap samples. The bagging score below is instead the vote share from `randomForest` with `mtry` equal to the number of covariates, so bagging and the random forest differ only by `mtry` and use the same vote.
+-   [`xgboost`](https://cran.r-project.org/package=xgboost) minimises a regularised boosting loss, with trees grown by a histogram algorithm. The boosting score below is `gbm` with `distribution = "bernoulli"`.
+-   [`adabag`](https://cran.r-project.org/package=adabag) fits AdaBoost.M1, which reweights misclassified rows, and also a bagging wrapper. AdaBoost is not the loss used below.
+
+## Packages shared with the other notes
+
+| Package | Role |
+|----|----|
+| `here` | Project paths. |
+| `dplyr` | The calibration bins. |
+| `ggplot2`, `tidyr` | Figures. |
+| `pROC` | ROC curves in `R/compare_methods/01_compare_on_test.R`. |
+
+# The sample and the four scores
+
+Let $Y_i=1$ if customer $i$ churns and $Y_i=0$ otherwise. The function $\sigma$ is the logistic function defined above.
+
+In `R/01_prepare_data.R` the object `n` is `nrow(telco)`, the number of rows before the split. It is not a sample size of a loss.
+
+``` r
+set.seed(2026)
+n <- nrow(telco)
+test_frac <- 0.30
+test_id <- sample(seq_len(n), size = floor(test_frac * n))
+```
+
+$\mathcal{I}_{\mathrm{test}}$ is `test_id` and $\mathcal{I}_{\mathrm{train}}$ is its complement, with $n_{\mathrm{train}}=|\mathcal{I}_{\mathrm{train}}|$ and $n_{\mathrm{test}}=|\mathcal{I}_{\mathrm{test}}|$. Inside the training rows, `R/trees/01_fit_trees.R` draws the validation indices with the same seed as the network note:
+
+``` r
+set.seed(2027)
+val_n <- floor(0.20 * nrow(train_fac))
+tree_val_id <- sample(seq_len(nrow(train_fac)), size = val_n)
+fit_fac <- train_fac[-tree_val_id, , drop = FALSE]
+val_fac <- train_fac[tree_val_id, , drop = FALSE]
+```
+
+$\mathcal{I}_{\mathrm{val}}$ is `tree_val_id` and $\mathcal{I}_{\mathrm{fit}}=\mathcal{I}_{\mathrm{train}}\setminus\mathcal{I}_{\mathrm{val}}$, with $n_{\mathrm{val}}=|\mathcal{I}_{\mathrm{val}}|$ and $n_{\mathrm{fit}}=|\mathcal{I}_{\mathrm{fit}}|$. This slice is used to choose the cost-complexity penalty of the single tree and the triple $(D,\nu,M)$ of the boosting fit. Bagging and the random forest are grown on every row of $\mathcal{I}_{\mathrm{train}}$. Their number of trees, and $m_{\mathrm{try}}$ for the forest, are chosen by the out-of-bag Brier score $B_{\mathrm{oob}}$ defined in the bagging section. Rows in $\mathcal{I}_{\mathrm{test}}$ are not used to grow a model or to choose $\mathtt{cp}$, $M$, $m_{\mathrm{try}}$, $D$, or $\nu$.
+
+Let $q$ be the number of covariates, the columns other than `Churn`. Here $q=19$. A factor counts as one covariate. This is not the count of dummy columns used by the neural network.
+
+For a sample $\mathcal{S}$ with $n_{\mathcal{S}}=|\mathcal{S}|$ and a score $\hat p$, $$
+B_{\mathcal{S}}(\hat p)=\frac{1}{n_{\mathcal{S}}}\sum_{i\in\mathcal{S}}(\hat p_i-y_i)^2.
+$$ $B_{\mathrm{val}}$ means $B_{\mathcal{I}_{\mathrm{val}}}$. It is the criterion for the tree and for boosting. The standard error of that Brier score uses the squared errors $e_i=(\hat p_i-y_i)^2$ on $\mathcal{I}_{\mathrm{val}}$: $$
+\mathrm{SE}=\frac{s_e}{\sqrt{n_{\mathrm{val}}}},
+$$ with $s_e$ their sample standard deviation (`brier_se()`).
+
+| Symbol | Score on a customer with covariates $\mathbf{x}$ | Code |
+|------------------------|------------------------|------------------------|
+| $\hat p^{\mathrm{tree}}(\mathbf{x})$ | Leaf relative frequency of $Y=1$ in one pruned `rpart` tree | `rpart_probability()` |
+| $\hat p^{\mathrm{bag}}(\mathbf{x})$ | Fraction of bagged trees that vote Yes. `mtry` $= q$ | `rf_probability()` |
+| $\hat p^{\mathrm{rf}}(\mathbf{x})$ | Fraction of forest trees that vote Yes. `mtry` $< q$ | `rf_probability()` |
+| $\hat p^{\mathrm{boost}}(\mathbf{x})$ | $\sigma(F_M(\mathbf{x}))$ from a bernoulli `gbm` fit | `gbm_probability()` |
+
+`as_churn_factor()` codes `Churn` as a factor with levels `No`, `Yes`, for `rpart` and `randomForest`. `as_churn_numeric()` codes it as $0/1$ for `gbm`.
+
+# One classification tree
+
+On a node $R$, write $\hat\pi_R$ for the proportion of rows in $R$ with $Y=1$, among the rows used to grow the tree. The Gini index of the node is $$
+G(R)=2\hat\pi_R(1-\hat\pi_R).
+$$ A split of $R$ into $R_L$ and $R_R$ is scored by the decrease $$
+\frac{|R|}{n_{\mathcal{S}}}G(R)-\frac{|R_L|}{n_{\mathcal{S}}}G(R_L)-\frac{|R_R|}{n_{\mathcal{S}}}G(R_R),
+$$ where $\mathcal{S}$ is the sample passed to `rpart` ($\mathcal{I}_{\mathrm{fit}}$ during the search, $\mathcal{I}_{\mathrm{train}}$ at the refit). The split with the largest decrease is kept, among splits that respect `minsplit` and `minbucket`.
+
+The probability attached to a leaf $R$ is the relative frequency, not a class label: $$
+\hat p^{\mathrm{tree}}(\mathbf{x})=\hat\pi_{R(\mathbf{x})}.
+$$ `rpart_probability()` reads that frequency:
+
+``` r
+as.numeric(predict(fit, newdata = newdata, type = "prob")[, "Yes"])
+```
+
+The tree grown in the search uses two controls, `cp = 0.001` and `xval = 0`:
+
+``` r
+rpart.control(cp = 0.001, xval = 0)
+```
+
+`xval` is the number of folds in the cross-validation that rpart would otherwise run by itself and report as the column `xerror`. The default is $10$ folds. Setting `xval = 0` means that column is not computed. The penalty kept below is still selected. It is the value on the cost-complexity path with the smallest $B_{\mathrm{val}}$. That selection uses $\mathcal{I}_{\mathrm{val}}$ once. It is not the average of the folds inside `rpart`.
+
+The quantity that `cp` penalises is not the Gini index. On $\mathcal{I}_{\mathrm{fit}}$, let $T_1$ be the tree with one leaf and no split, and let $n_t$ be the number of fitting rows in a leaf $t$. If that leaf is labelled by its majority class, its misclassification rate is $1-\max(\hat\pi_t,1-\hat\pi_t)$. The resubstitution risk of a tree $T$ is $$
+R(T)=\sum_{t\,\mathrm{leaf\,of\,}T}\frac{n_t}{n_{\mathrm{fit}}}\bigl(1-\max(\hat\pi_t,1-\hat\pi_t)\bigr).
+$$ $R(T_1)$ is the misclassification rate of the majority class on $\mathcal{I}_{\mathrm{fit}}$. Write $n_{\mathrm{split}}(T)$ for the number of splits in $T$. The cost complexity used by `rpart` is $$
+R_{\mathrm{cp}}(T)=R(T)+\mathrm{cp}\cdot n_{\mathrm{split}}(T)\cdot R(T_1).
+$$ A split that produces a tree $T'$ from a tree $T$ is not pursued when $$
+R(T)-R(T')<\mathrm{cp}\cdot R(T_1).
+$$ With the control `cp = 0.001`, the grown tree $T_+$ therefore contains only splits that decrease $R$ by at least $0.001\,R(T_1)$. The Gini index still decides which legal split is best. The penalty $\mathrm{cp}$ decides which of those splits are small enough to be dropped.
+
+As the penalty runs from $0$ to $\infty$, one can show that the subtree of $T_+$ that minimises $R_{\mathrm{cp}}$ changes only at isolated values of $\mathrm{cp}$. The result is a nested path of subtrees, from $T_+$ down to $T_1$. `rpart` records that path in `tree_grown$cptable`. The column `CP` holds one penalty per subtree. For each such number the validation Brier of the pruned leaf frequencies is
+
+``` r
+pruned <- prune(tree_grown, cp = cp)
+p_val <- rpart_probability(pruned, val_fac)
+brier_score(y_val, p_val)
+```
+
+`prune(tree_grown, cp = cp)` collapses every split whose recorded complexity is at most `cp`, and returns the subtree on this path that minimises $R_{\mathrm{cp}}$ at that penalty. The chosen row minimises $B_{\mathrm{val}}$, and breaks a tie toward the larger `cp`, which is the smaller tree:
+
+``` r
+tree_selection[order(tree_selection$val_brier, -tree_selection$cp), ][1, ]
+```
+
+The final tree is grown again on $\mathcal{I}_{\mathrm{train}}$ with the same `cp` floor $0.001$, then pruned at the chosen `cp`. The number of leaves can differ from the number on $\mathcal{I}_{\mathrm{fit}}$, because $R$ and the splits are recomputed on $\mathcal{I}_{\mathrm{train}}$.
+
+# Bagging
+
+The bagging forest is grown on $\mathcal{I}_{\mathrm{train}}$, not on $\mathcal{I}_{\mathrm{fit}}$. There is no second validation slice inside this fit. Each tree has its own bootstrap sample, and the rows left out of that sample are the rows used to score the tree.
+
+Bootstrap sample $\mathcal{S}_b$ is drawn from $\mathcal{I}_{\mathrm{train}}$ with replacement. Its size is $n_{\mathrm{train}}$: the same customer can be drawn more than once, and the number of draws is $n_{\mathrm{train}}$. In the call this size is `sampsize = nrow(train_fac)`.
+
+``` r
+randomForest(
+  Churn ~ .,
+  data = train_fac,
+  ntree = 500,
+  mtry = p_cov,
+  replace = TRUE,
+  sampsize = nrow(train_fac),
+  keep.inbag = TRUE
+)
+```
+
+`mtry` $= q$, so every covariate is available at every split, and `nodesize` $= 1$. `keep.inbag = TRUE` stores the matrix `fit$inbag`. The entry `inbag[i, b]` is the number of times training customer $i$ was drawn into $\mathcal{S}_b$. Customer $i$ is out of bag for tree $b$ when that count is $0$. The out-of-bag set of tree $b$ is $$
+O_b=\{i\in\mathcal{I}_{\mathrm{train}}:\mathtt{inbag}[i,b]=0\}.
+$$ Tree $b$ was not grown on any row in $O_b$. Those rows are the validation rows of tree $b$. A customer who is out of bag for one tree can be inside $\mathcal{S}_{b'}$ for another tree. The probability that one draw misses customer $i$ is $1-1/n_{\mathrm{train}}$. Across the $n_{\mathrm{train}}$ draws, $$
+P(i\in O_b)=\Bigl(1-\frac{1}{n_{\mathrm{train}}}\Bigr)^{n_{\mathrm{train}}},
+$$ which is close to $0.368$ at $n_{\mathrm{train}}=4931$.
+
+Let $T_b(\mathbf{x})\in\{\mathrm{No},\mathrm{Yes}\}$ be the class vote of tree $b$: the majority class in the leaf that contains $\mathbf{x}$. For a customer who was not in the training data, every one of the $M$ trees is eligible, and the bagging score is $$
+\hat p^{\mathrm{bag}}(\mathbf{x})
+=\frac{1}{M}\sum_{b=1}^{M}\mathbf{1}\{T_b(\mathbf{x})=\mathrm{Yes}\}.
+$$ This is the score used on $\mathcal{I}_{\mathrm{test}}$. It is not the average of the leaf frequencies $\hat\pi_{R_b(\mathbf{x})}$. A tree with `nodesize` $= 1$ has pure leaves, so its leaf frequency is $0$ or $1$ and the vote equals that frequency.
+
+For a training customer the same average would count trees that were grown on that customer. The out-of-bag score at $M$ trees uses only the trees that missed the customer. Write $$
+n_i(M)=\sum_{b=1}^{M}\mathbf{1}\{i\in O_b\}
+$$ for the number of the first $M$ trees that left $i$ out. When $n_i(M)>0$, $$
+\hat p^{\mathrm{oob}}_i(M)
+=\frac{1}{n_i(M)}\sum_{b=1}^{M}\mathbf{1}\{i\in O_b\}\,\mathbf{1}\{T_b(\mathbf{x}_i)=\mathrm{Yes}\}.
+$$ Let $n_{\mathrm{oob}}(M)$ be the number of training customers with $n_i(M)>0$. The out-of-bag Brier score is $$
+B_{\mathrm{oob}}(M)
+=\frac{1}{n_{\mathrm{oob}}(M)}
+\sum_{i\in\mathcal{I}_{\mathrm{train}}:\,n_i(M)>0}
+\bigl(\hat p^{\mathrm{oob}}_i(M)-y_i\bigr)^2.
+$$ This is the validation criterion for bagging. It is not $B_{\mathrm{val}}=B_{\mathcal{I}_{\mathrm{val}}}$. The rows that enter the sum are training rows, but each squared error uses only trees for which that row was out of bag. `oob_vote_share_path()` builds $\hat p^{\mathrm{oob}}_i(M)$ for $M=1,\ldots,500$ from one forest:
+
+``` r
+votes <- predict(fit, newdata = data, predict.all = TRUE)$individual
+oob <- fit$inbag == 0
+yes_oob <- (votes == "Yes") & oob
+c_yes <- t(apply(yes_oob, 1L, cumsum))
+c_n <- t(apply(oob, 1L, cumsum))
+```
+
+Column $M$ of `c_yes / c_n`, on the rows where `c_n` is positive, is $\hat p^{\mathrm{oob}}_i(M)$. `brier_along_oob()` returns $B_{\mathrm{oob}}(M)$. The chosen $M$ minimises $B_{\mathrm{oob}}(M)$ and breaks a tie toward the smaller $M$. The standard error is $s_e/\sqrt{n_{\mathrm{oob}}(M)}$, where $s_e$ is the sample standard deviation of the squared errors that enter $B_{\mathrm{oob}}(M)$. The seed of this forest is `set.seed(31000)`, and the forest has $\mathtt{ntree}=500$ trees. The test score uses the first $M$ of those trees, through `vote_share_at()`. There is no second forest.
+
+`predict(fit, newdata = train_fac)` averages trees that contain the training row as well as trees that do not. The Brier score of that prediction on $\mathcal{I}_{\mathrm{train}}$ is not $B_{\mathrm{oob}}(M)$.
+
+# Random forest
+
+A random forest is the same construction on $\mathcal{I}_{\mathrm{train}}$, with the same bootstrap size $n_{\mathrm{train}}$ and the same out-of-bag score $B_{\mathrm{oob}}(M)$. At each split, $m_{\mathrm{try}}$ covariates are drawn at random and the Gini search is restricted to those covariates. The score on a new customer is again the vote share of the first $M$ trees. The grid is $m_{\mathrm{try}}\in\{2,4,6,8,12\}$ and $M\in\{1,\ldots,500\}$. Bagging is the case $m_{\mathrm{try}}=q=19$, so it is not repeated inside this grid. $\lfloor\sqrt{19}\rfloor=4$ is one of the grid values; it is not imposed as the choice.
+
+Each $m_{\mathrm{try}}$ is one `randomForest` call with `ntree = 500`, `keep.inbag = TRUE`, `importance = TRUE`, and seed `32000 + mtry`. The pair $(m_{\mathrm{try}}, M)$ minimises $B_{\mathrm{oob}}(M)$, then breaks ties toward the smaller $M$, then toward the smaller $m_{\mathrm{try}}$. The forest that wins is the one whose test score and permutation importance are reported. It is not refit.
+
+On that forest, $I_j$ is the permutation importance defined in the package section. The sums that define $e_b$ and $e_{b,j}$ run over $O_b$, the training rows left out of $\mathcal{S}_b$, and over no other rows. Tree $b$ was grown on $\mathcal{S}_b$, so a misclassification rate computed on $\mathcal{S}_b$ is a rate on rows used to grow the tree. Both $e_b$ and $e_{b,j}$ are computed on $O_b$, where tree $b$ did not see the row. `importance(rf_fit, scale = FALSE)[, "MeanDecreaseAccuracy"]` is $I_j$ for the $\mathtt{ntree}=500$ trees stored in `rf_fit`. The argument `scale = FALSE` keeps the average in the definition of $I_j$; `scale = TRUE` would divide each $I_j$ by the standard deviation of the $500$ increases $(e_{b,j}-e_b)$. The churn score $\hat p^{\mathrm{rf}}$ averages the first $M$ of those trees, the $M$ that minimises $B_{\mathrm{oob}}(M)$. When that $M$ is smaller than $500$, $I_j$ still averages all $500$ trees.
+
+The permutation is a way to break covariate $j$ without refitting the tree. On $O_b$, the values of covariate $j$ are reassigned among the same customers. The list of values is unchanged. What changes is which customer carries which value, so covariate $j$ is no longer aligned with $Y_i$ or with the other covariates of the same row. A split that reads covariate $j$ can send customer $i$ into another leaf, and the vote can change. The increase contributed by tree $b$ is the average of those changes of the error indicator, $$
+e_{b,j}-e_b
+=\frac{1}{|O_b|}\sum_{i\in O_b}\Big(
+\mathbf{1}\{T_b(\mathbf{x}_i^{(j)})\ne Y_i\}
+-\mathbf{1}\{T_b(\mathbf{x}_i)\ne Y_i\}
+\Big).
+$$ A positive term is an out-of-bag customer whose vote was correct before the permutation and wrong after it. A negative term is a customer whose vote was wrong before and correct after. $I_j$ is the average of $e_{b,j}-e_b$ over the stored trees, so it is the net change in the out-of-bag misclassification rate. If $I_j=0.02$, scrambling covariate $j$ adds about two mistakes per hundred out-of-bag customers. The covariate matters for the vote to the extent that the customer's own value, rather than a value taken from another out-of-bag customer, keeps that vote equal to $Y_i$. If tree $b$ has no split on covariate $j$, every path stays the same, $e_{b,j}=e_b$, and that tree adds $0$ to $I_j$.
+
+The other stored summary is the Gini decrease. It uses the splits, not the out-of-bag rows. For one split, the decrease is the same weighted drop in $G(R)$ as in the classification tree. Write $\Delta_s$ for that drop at split $s$, computed on the bootstrap sample of the tree, and write $\mathcal{P}_b(j)$ for the set of splits of tree $b$ that select covariate $j$. Then $$
+\mathrm{Gini}_j
+=\frac{1}{\mathtt{ntree}}\sum_{b=1}^{\mathtt{ntree}}\sum_{s\in\mathcal{P}_b(j)}\Delta_s.
+$$ `importance(rf_fit, scale = FALSE)[, "MeanDecreaseGini"]` returns $\mathrm{Gini}_j$ for the forest. The bagging fit stores the same column, because every bagged tree is also grown by the Gini split, and `importance = FALSE` still records it. `importance(bag_fit)[, "MeanDecreaseGini"]` is $\mathrm{Gini}_j$ with the average taken over the $500$ stored bagged trees and with $m_{\mathrm{try}}=q$. The assessment section draws that bar chart for bagging and for the forest. Each legend is the method name, in that method's colour. Both Gini charts, and the $I_j$ chart, average all $500$ stored trees. The churn scores use the first $M$ of those trees.
+
+$I_j$ is not in the bagging object. `importance = TRUE` is what asks `randomForest` to permute out-of-bag rows, and only the forest calls set it. The third bar chart is $I_j$ for the random forest.
+
+The same difference $e_{b,j}-e_b$ is defined when $m_{\mathrm{try}}=q$. It is computed in this note only for the forest. Bagging offers every covariate at every split, so the Gini decrease already sums the improvements of the covariates that won a comparison against all $q$ of them. The forest offers only $m_{\mathrm{try}}<q$ covariates at a split. A covariate can be left out of that draw at a node where it would have cut the Gini index, and the Gini decrease then has no term for that node. Once the tree is grown, the permutation changes covariate $j$ on $O_b$ whether or not the draw offered it, and $e_{b,j}-e_b$ is the rise in misclassification. The forest calls set `importance = TRUE`. The bagging call does not.
+
+# Boosting
+
+On $\mathcal{I}_{\mathrm{fit}}$, the bernoulli loss at a function $F$ is the negative log-likelihood $$
+\mathcal{L}_{\mathcal{I}_{\mathrm{fit}}}(F)
+=-\sum_{i\in\mathcal{I}_{\mathrm{fit}}}\Big(y_i\log \sigma(F(\mathbf{x}_i))+(1-y_i)\log\big(1-\sigma(F(\mathbf{x}_i))\big)\Big).
+$$ `gbm` starts from the constant $F_0=\operatorname{logit}(\bar y_{\mathcal{I}_{\mathrm{fit}}})$ and adds a regression tree $f_m$ fit to the gradient of $\mathcal{L}_{\mathcal{I}_{\mathrm{fit}}}$ at $F_{m-1}$: $$
+F_m(\mathbf{x})=F_{m-1}(\mathbf{x})+\nu f_m(\mathbf{x}),
+\qquad
+\hat p^{\mathrm{boost}}(\mathbf{x})=\sigma(F_M(\mathbf{x})).
+$$ The gradient contribution of row $i$ is $y_i-\sigma(F_{m-1}(\mathbf{x}_i))$. `interaction.depth` $D$ is the number of splits in $f_m$. $D=1$ means $f_m$ depends on one covariate. Each tree is fit on its own subset of $\mathcal{I}_{\mathrm{fit}}$, the set $\mathcal{A}_m$ defined below. The refit on $\mathcal{I}_{\mathrm{train}}$ uses the same loss with the sum taken over $\mathcal{I}_{\mathrm{train}}$, and each of its trees has its own subset of $\mathcal{I}_{\mathrm{train}}$.
+
+That contribution is the negative derivative of one summand of the loss. Write $\psi(y,F)=-y\log\sigma(F)-(1-y)\log\big(1-\sigma(F)\big)$. Then $\partial\psi/\partial F=\sigma(F)-y$, and the working response on row $i$ is $$
+z_i
+=-\frac{\partial\psi}{\partial F}\big(y_i,F_{m-1}(\mathbf{x}_i)\big)
+=y_i-\sigma\big(F_{m-1}(\mathbf{x}_i)\big).
+$$ At step $m$, `gbm` draws a subset $\mathcal{A}_m\subset\mathcal{I}_{\mathrm{fit}}$ and fits the regression tree only to the pairs $(\mathbf{x}_i,z_i)$ with $i\in\mathcal{A}_m$. The draw is without replacement and $$
+|\mathcal{A}_m|=\lfloor 0.5\,n_{\mathrm{fit}}\rfloor.
+$$ Every fitting customer has the same probability of being included, and no customer is included twice. This is the argument `bag.fraction` $= 0.5$. It is not a bootstrap sample of size $n_{\mathrm{fit}}$, and it is not $\mathcal{I}_{\mathrm{val}}$. A customer in $\mathcal{I}_{\mathrm{fit}}\setminus\mathcal{A}_m$ still has a working response $z_i$, computed from $F_{m-1}$ on every fitting row, but that customer does not enter the sums that choose the splits or the leaf constants of tree $m$. The function $f_m$ is then evaluated at every $\mathbf{x}$, so the update $F_m=F_{m-1}+\nu f_m$ also moves the probability of the customers left out of $\mathcal{A}_m$. A new subset is drawn at the next step.
+
+The random half is there so that successive trees are not all fit to the same rows. If every tree used all of $\mathcal{I}_{\mathrm{fit}}$, each correction would follow the residuals of one fixed sample. Changing $\mathcal{A}_m$ at each step makes $f_m$ depend on a different half, and the sum $\nu f_1+\cdots+\nu f_M$ varies less from one sample to another. The fraction $0.5$ is fixed in this note. The grid does not choose it. A candidate split is scored by the decrease in the residual sum of squares of $z$, $$
+\sum_{i\in R}(z_i-\bar z_R)^2
+-\sum_{i\in R_L}(z_i-\bar z_{R_L})^2
+-\sum_{i\in R_R}(z_i-\bar z_{R_R})^2,
+$$ where $\bar z_R$ is the mean of $z_i$ on the node $R$ and the sums run over $i\in\mathcal{A}_m$ in the node. The tree keeps the split with the largest decrease, with at most $D$ splits in total and at least `n.minobsinnode` $= 10$ rows of $\mathcal{A}_m$ in a leaf. The leaves of this tree are regions $R_{m,1},\ldots,R_{m,K}$ with $K\le D+1$.
+
+The constant written in leaf $k$ is the Newton step for one common addition to $F_{m-1}$ on that leaf. The second derivative of $\psi$ in $F$ is $\sigma(F)\big(1-\sigma(F)\big)$, so $$
+\rho_{m,k}
+=\frac{\sum_{i\in R_{m,k}}\big(y_i-\sigma(F_{m-1}(\mathbf{x}_i))\big)}
+{\sum_{i\in R_{m,k}}\sigma\big(F_{m-1}(\mathbf{x}_i)\big)\big(1-\sigma(F_{m-1}(\mathbf{x}_i))\big)}.
+$$ The two sums use the rows of $\mathcal{A}_m$ in the leaf. Then $f_m(\mathbf{x})=\rho_{m,k(\mathbf{x})}$, with $k(\mathbf{x})$ the leaf that contains $\mathbf{x}$, and $F_m=F_{m-1}+\nu f_m$ multiplies that constant by `shrinkage`. In the call below, `distribution = "bernoulli"` selects $\psi$, `bag.fraction` $= 0.5$ is the fraction that sets $|\mathcal{A}_m|$, `interaction.depth` is $D$, and `shrinkage` is $\nu$.
+
+$z_i>0$ when $y_i>\sigma(F_{m-1}(\mathbf{x}_i))$, so the current probability is below the observed label, and $z_i<0$ when the current probability is above the label. The squared-error splits put into one leaf customers whose covariates fall in the same region and whose residuals $z_i$ point the same way. When the numerator of $\rho_{m,k}$ is positive, $\nu\rho_{m,k}>0$: $F$ increases on that leaf and $\sigma(F)$ rises for every customer who falls there. The next working response is built from $F_m$, so it is the gap left by this step. A classification tree partitions the labels $y_i$ once. Each boosting tree partitions the remaining gap $y_i-\sigma(F_{m-1}(\mathbf{x}_i))$, and $\nu<1$ leaves part of that gap for the following tree to split.
+
+The grid is $D\in\{1,2,3\}$, $\nu\in\{0.01,0.05,0.1\}$, and $M\in\{25,50,\ldots,1000\}$. One `gbm` fit with `n.trees = 1000` produces the whole path in $M$ for a fixed $(D,\nu)$:
+
+``` r
+gbm(
+  Churn ~ .,
+  data = fit_num,
+  distribution = "bernoulli",
+  n.trees = 1000,
+  interaction.depth = depth,
+  shrinkage = shrinkage,
+  bag.fraction = 0.5,
+  n.minobsinnode = 10,
+  cv.folds = 0,
+  n.cores = 1,
+  verbose = FALSE
+)
+```
+
+The seed of the pair $(D,\nu)$ is `33000 + 100 * depth + round(1000 * shrinkage)`. `predict(..., n.trees = boost_M_grid, type = "response")` returns $\sigma(F_M)$ at each $M$ on the grid. The triple $(D,\nu,M)$ minimises $B_{\mathrm{val}}$, then breaks ties toward the smaller $M$, then the smaller $D$, then the smaller $\nu$. The refit on $\mathcal{I}_{\mathrm{train}}$ uses `set.seed(43000)` and `n.trees` equal to the chosen $M$.
+
+# What is chosen
+
+```{r}
+#| label: fit-trees
+source(here("R", "trees", "01_fit_trees.R"))
+```
+
+The printed cost-complexity table is $B_{\mathrm{val}}$ of $\hat p^{\mathrm{tree}}$ after `prune()`. The chosen row minimises that column: $\mathtt{cp}=`r signif(tree_chosen$cp, 4)`$, $`r tree_chosen$n_leaf`$ leaves, $B_{\mathrm{val}}=`r num4(tree_chosen$val_brier)`$, $\mathrm{SE}=`r num4(tree_chosen$val_brier_se)`$. Those $`r tree_chosen$n_leaf`$ leaves belong to the pruned tree on $\mathcal{I}_{\mathrm{fit}}$. The score used from here on is`tree_fit`, grown on $\mathcal{I}_{\mathrm{train}}$ and pruned at the same $\mathtt{cp}$. That tree has $`r sum(tree_fit$frame$var == "<leaf>")`$ leaves. The one-leaf tree, which predicts the constant proportion of $Y=1$ on $\mathcal{I}_{\mathrm{fit}}$ for every validation row, has $B_{\mathrm{val}}=`r num4(tree_selection$val_brier[tree_selection$n_leaf == 1])`$.
+
+Bagging, with $m_{\mathrm{try}}=q=`r p_cov`$, chooses $M=`r bag_chosen$M`$ and $B_{\mathrm{oob}}(M)=`r num4(bag_chosen$oob_brier)`$, with standard error $`r num4(bag_chosen$oob_brier_se)`$. At $M=50$ the same path has $B_{\mathrm{oob}}=`r num4(bag_path_plot$oob_brier[bag_path_plot$M == 50])`$, and at $M=500$ it has $B_{\mathrm{oob}}=`r num4(bag_path_plot$oob_brier[bag_path_plot$M == 500])`$. The absolute difference between $M=50$ and $M=`r bag_chosen$M`$ is $`r num4(abs(bag_path_plot$oob_brier[bag_path_plot$M == 50] - bag_chosen$oob_brier))`$.
+
+The forest grid chooses $m_{\mathrm{try}}=`r rf_chosen$mtry`$, $M=`r rf_chosen$M`$, $B_{\mathrm{oob}}(M)=`r num4(rf_chosen$oob_brier)`$, with standard error $`r num4(rf_chosen$oob_brier_se)`$. In the printed table, the row $m_{\mathrm{try}}=4$ has $B_{\mathrm{oob}}=`r num4(rf_best_by_mtry$oob_brier[rf_best_by_mtry$mtry == 4])`$. The absolute difference from the chosen row is $`r num4(abs(rf_best_by_mtry$oob_brier[rf_best_by_mtry$mtry == 4] - rf_chosen$oob_brier))`$. The sort`order(oob_brier, M, mtry)`is what returns $m_{\mathrm{try}}=`r rf_chosen$mtry`$. Here $I_j$ averages the `r rf_fit$ntree` stored trees, and $\hat p^{\mathrm{rf}}$ averages the first `r rf_chosen$M` of them.
+
+Boosting chooses $D=`r boost_chosen$depth`$, $\nu=`r boost_chosen$shrinkage`$, $M=`r boost_chosen$M`$, $B_{\mathrm{val}}=`r num4(boost_chosen$val_brier)`$, $\mathrm{SE}=`r num4(boost_chosen$val_brier_se)`$. $D=1$ means each added tree uses one covariate. In that table the next-smallest $B_{\mathrm{val}}$ is the row $D=1$, $\nu=0.05$, $M=400$, with $B_{\mathrm{val}}=`r num4(boost_best_by_pair$val_brier[boost_best_by_pair$depth == 1 & boost_best_by_pair$shrinkage == 0.05])`$. The absolute difference is $`r num4(abs(boost_best_by_pair$val_brier[boost_best_by_pair$depth == 1 & boost_best_by_pair$shrinkage == 0.05] - boost_chosen$val_brier))`$, which is smaller than $\mathrm{SE}=`r num4(boost_chosen$val_brier_se)`$.
+
+# Scores on the held-out customers
+
+$B_{\mathcal{S}}$ was defined above. The log loss on the same sample is $$
+L_{\mathcal{S}}(\hat p)
+=-\frac{1}{n_{\mathcal{S}}}\sum_{i\in\mathcal{S}}\Big(y_i\log\hat p_i+(1-y_i)\log(1-\hat p_i)\Big),
+$$ with $\hat p$ clipped to $[10^{-6},1-10^{-6}]$ inside `log_loss()`. $\mathcal{L}_{\mathcal{I}_{\mathrm{fit}}}(F)$ is a sum, not this average, and it is a function of $F$ during the boosting fit. $L_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{boost}})$ is the average on the test rows after $M$ and $\nu$ have been fixed.
+
+Let $\mathbf{x}^{(1)}$ be drawn uniformly from $\{i\in\mathcal{S}:Y_i=1\}$ and $\mathbf{x}^{(0)}$ independently and uniformly from $\{i\in\mathcal{S}:Y_i=0\}$. Write $\hat p(\mathbf{x})$ for the score at a covariate vector, and $\hat p_i=\hat p(\mathbf{x}_i)$ for customer $i$. Then $$
+\mathrm{AUC}_{\mathcal{S}}
+=P\big(\hat p(\mathbf{x}^{(1)})>\hat p(\mathbf{x}^{(0)})\big)
++\frac12 P\big(\hat p(\mathbf{x}^{(1)})=\hat p(\mathbf{x}^{(0)})\big).
+$$ The comparison program computes this with `roc(..., levels = c(0, 1), direction = "<")`.
+
+On $\mathcal{I}_{\mathrm{test}}$, $\hat Y_i=\mathbf{1}\{\hat p_i\ge c\}$. The four counts of that rule are $$
+\begin{aligned}
+\mathrm{TP}&=|\{i\in\mathcal{I}_{\mathrm{test}}:Y_i=1,\hat Y_i=1\}|,\\
+\mathrm{FP}&=|\{i\in\mathcal{I}_{\mathrm{test}}:Y_i=0,\hat Y_i=1\}|,\\
+\mathrm{TN}&=|\{i\in\mathcal{I}_{\mathrm{test}}:Y_i=0,\hat Y_i=0\}|,\\
+\mathrm{FN}&=|\{i\in\mathcal{I}_{\mathrm{test}}:Y_i=1,\hat Y_i=0\}|.
+\end{aligned}
+$$ Sensitivity, specificity, accuracy, and precision are $$
+\mathrm{Sens}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FN}},\quad
+\mathrm{Spec}=\frac{\mathrm{TN}}{\mathrm{TN}+\mathrm{FP}},\quad
+\mathrm{Acc}=\frac{\mathrm{TP}+\mathrm{TN}}{n_{\mathrm{test}}},\quad
+\mathrm{Prec}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FP}}.
+$$ `confusion_at()` returns those four ratios. The column `precision` is $\mathrm{Prec}$. The two cuts are $c=0.5$ and $c=\bar y_{\mathrm{train}}=n_{\mathrm{train}}^{-1}\sum_{i\in\mathcal{I}_{\mathrm{train}}} y_i$.
+
+If $\hat p_i=P(Y_i=1\mid\mathbf{x}_i)=p$, a false positive costs $C_{10}$, a false negative costs $C_{01}$, and a correct label costs $0$, the expected costs of the two actions are $R(0,p)=p\,C_{01}$ and $R(1,p)=(1-p)\,C_{10}$. Then $R(1,p)\le R(0,p)$ rearranges to $C_{10}\le p(C_{10}+C_{01})$. When $C_{10}+C_{01}>0$, $$
+c=\frac{C_{10}}{C_{10}+C_{01}}.
+$$ The tables use $c=0.5$ and $c=\bar y_{\mathrm{train}}$. They do not estimate $C_{10}$ or $C_{01}$.
+
+`calibration_df()` splits $\mathcal{I}_{\mathrm{test}}$ into bins of $\hat p$. Bin $b$ has index set $\mathcal{B}_b$ and size $n_{\mathcal{B}_b}=|\mathcal{B}_b|$, and the plot is $\overline{\hat p}_b$ against $\bar y_b$.
+
+`make_profile()` repeats one training row, with numeric covariates at their training median and factors at their training mode, once for each tenure in $0,1,\ldots,72$. It then sets `Contract` to either month-to-month or two-year, and sets `TotalCharges = tenure * MonthlyCharges`. The curves are $\hat p^{\mathrm{tree}}$, $\hat p^{\mathrm{bag}}$, $\hat p^{\mathrm{rf}}$, $\hat p^{\mathrm{boost}}$, and $\hat p^{\mathrm{GLM}}=\sigma(\mathbf{x}^\top\hat{\boldsymbol{\beta}}_{\mathrm{MLE}})$ from `glm` on $\mathcal{I}_{\mathrm{train}}$, each as a function of tenure at those two contracts.
+
+```{r}
+#| label: assess-trees
+#| fig-cap:
+#|   - "Pruned classification tree fit on the training rows. The number under a node is the number of training customers in the node."
+#|   - "Validation Brier of the pruned tree against its number of leaves. The open circle is the chosen tree."
+#|   - "Bagging: out-of-bag Brier of the vote share against the number of trees. The open circle is the chosen M."
+#|   - "Random forest: out-of-bag Brier against the number of trees, one curve for each m_try. The open circle is the chosen pair."
+#|   - "Boosting: validation Brier against the number of trees. Panels are interaction.depth. Colour is the shrinkage. The open circle is the chosen triple."
+#|   - "Gini importance for bagging. The bar is the average, over the bagged trees, of the total Gini decrease at splits that use that covariate. The legend names the method."
+#|   - "Gini importance for the random forest. The bar is the same average over the forest trees. The legend names the method."
+#|   - "Permutation importance I_j for the random forest only. The bar is the average extra out-of-bag misclassification rate when that covariate is reassigned. The legend names the method."
+#|   - "Calibration of the four test scores. Each point is one bin of predicted probability."
+#|   - "Predicted probability against tenure at two contracts. The other covariates are fixed at one training row. The logistic curve is the GLM on the training rows."
+source(here("R", "trees", "02_assess_trees.R"))
+```
+
+The printed `tree_fit` is the same partition as the drawing. The root split is on `r as.character(tree_fit$frame$var[1])`.
+
+On $\mathcal{I}_{\mathrm{test}}$, $$
+\begin{aligned}
+B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{tree}})&=`r num4(tree_holdout$test_brier[1])`,\\
+B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{bag}})&=`r num4(tree_holdout$test_brier[2])`,\\
+B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{rf}})&=`r num4(tree_holdout$test_brier[3])`,\\
+B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{\mathrm{boost}})&=`r num4(tree_holdout$test_brier[4])`.
+\end{aligned}
+$$ The column `train_brier` is $B_{\mathcal{I}_{\mathrm{train}}}$ of the score that is used on a new customer: for the two forests that is the vote share of the first $M$ trees, including trees that were grown on the training row. For bagging that number is $`r num4(tree_holdout$train_brier[2])`$, and for the forest it is $`r num4(tree_holdout$train_brier[3])`$. The column `oob_brier` is $B_{\mathrm{oob}}(M)$ at the chosen $M$: $`r num4(tree_holdout$oob_brier[2])`$ for bagging and $`r num4(tree_holdout$oob_brier[3])`$ for the forest. The tree and the boosting fit have no out-of-bag vote, so those two entries are missing. In the order tree, bagging, forest, boosting, the test log losses are $`r num4(tree_holdout$test_log_loss[1])`$, $`r num4(tree_holdout$test_log_loss[2])`$, $`r num4(tree_holdout$test_log_loss[3])`$, and $`r num4(tree_holdout$test_log_loss[4])`$.
+
+At $c=0.5$, sensitivity is $`r num3(tree_confusion$sensitivity[1])`$ for the tree, $`r num3(tree_confusion$sensitivity[2])`$ for bagging, $`r num3(tree_confusion$sensitivity[3])`$ for the forest, and $`r num3(tree_confusion$sensitivity[4])`$ for boosting. At $c=\bar y_{\mathrm{train}}$, the same four sensitivities are $`r num3(tree_confusion$sensitivity[5])`$, $`r num3(tree_confusion$sensitivity[6])`$, $`r num3(tree_confusion$sensitivity[7])`$, and $`r num3(tree_confusion$sensitivity[8])`$.
+
+# Seven scores on one test set
+
+`save_test_predictions()` writes one file per score. `load_test_predictions()` reads every `output/test_predictions/*.rds`, checks that `test_row` and $y$ agree, and `R/compare_methods/01_compare_on_test.R` computes $B_{\mathcal{I}_{\mathrm{test}}}$, $L_{\mathcal{I}_{\mathrm{test}}}$, $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}$, and, for two scores $\hat p^{(m)}$ and $\hat p^{(m')}$, $$
+\Delta(m,m')
+=\frac{1}{n_{\mathrm{test}}}\sum_{i\in\mathcal{I}_{\mathrm{test}}}
+\Big[\big(\hat p_i^{(m)}-y_i\big)^2-\big(\hat p_i^{(m')}-y_i\big)^2\Big].
+$$ The files written by this note are `04_classification_tree`, `05_bagging`, `06_random_forest`, and `07_boosting`. The linear probability model, the logistic regression, and the network are the files `01`, `02`, and `03` already in that folder. Lexical order of the file name is the row order of the table.
+
+Write $\bar y_{\mathrm{train}}=n_{\mathrm{train}}^{-1}\sum_{i\in\mathcal{I}_{\mathrm{train}}} y_i$ for the training churn rate, and write $B_0$ for the test Brier score of the constant score $\hat p_i=\bar y_{\mathrm{train}}$: $$
+B_0=B_{\mathcal{I}_{\mathrm{test}}}(\bar y_{\mathrm{train}})
+=\frac{1}{n_{\mathrm{test}}}\sum_{i\in\mathcal{I}_{\mathrm{test}}}(\bar y_{\mathrm{train}}-y_i)^2.
+$$ The Brier skill of a score $\hat p$ is $$
+\mathrm{Skill}(\hat p)=1-\frac{B_{\mathcal{I}_{\mathrm{test}}}(\hat p)}{B_0}.
+$$
+
+```{r}
+#| label: compare-methods
+#| fig-cap:
+#|   - "ROC curves on the shared test set."
+#|   - "Calibration on the shared test set."
+#|   - "Test Brier score with a 95% percentile bootstrap interval. The dashed line is a constant forecast at the training churn rate."
+source(here("R", "compare_methods", "00_export_linear_logistic.R"))
+source(here("R", "compare_methods", "01_compare_on_test.R"))
+```
+
+```{r}
+#| label: name-the-gaps
+score_of <- function(label) {
+  comparison_scores[comparison_scores$method_label == label, ]
+}
+gap_of <- function(a, b) {
+  hit <- comparison_brier_diff$method_a == a & comparison_brier_diff$method_b == b
+  comparison_brier_diff[hit, ]
+}
+tree_row <- score_of("Classification tree")
+bag_row <- score_of("Bagging")
+rf_row <- score_of("Random forest")
+boost_row <- score_of("Boosting")
+logit_row <- score_of("Logistic regression")
+nn_row <- score_of("Neural network")
+lpm_row <- score_of("Linear probability")
+gap_tree_bag <- gap_of("Classification tree", "Bagging")
+gap_bag_rf <- gap_of("Bagging", "Random forest")
+gap_logit_rf <- gap_of("Logistic regression", "Random forest")
+gap_logit_boost <- gap_of("Logistic regression", "Boosting")
+gap_nn_boost <- gap_of("Neural network", "Boosting")
+```
+
+In this run, $B_0=`r num4(brier_ref)`$.
+
+|   | Tree | Bagging | Random forest | Boosting |
+|---------------|---------------|---------------|---------------|---------------|
+| $B_{\mathcal{I}_{\mathrm{test}}}$ | `r num4(tree_row$brier)` | `r num4(bag_row$brier)` | `r num4(rf_row$brier)` | `r num4(boost_row$brier)` |
+| $95\%$ interval for $B$ | `r num4(tree_row$brier_ci_low)` to `r num4(tree_row$brier_ci_high)` | `r num4(bag_row$brier_ci_low)` to `r num4(bag_row$brier_ci_high)` | `r num4(rf_row$brier_ci_low)` to `r num4(rf_row$brier_ci_high)` | `r num4(boost_row$brier_ci_low)` to `r num4(boost_row$brier_ci_high)` |
+| Skill | `r num3(tree_row$brier_skill)` | `r num3(bag_row$brier_skill)` | `r num3(rf_row$brier_skill)` | `r num3(boost_row$brier_skill)` |
+| $L_{\mathcal{I}_{\mathrm{test}}}$ | `r num4(tree_row$log_loss)` | `r num4(bag_row$log_loss)` | `r num4(rf_row$log_loss)` | `r num4(boost_row$log_loss)` |
+| $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}$ | `r num3(tree_row$auc)` | `r num3(bag_row$auc)` | `r num3(rf_row$auc)` | `r num3(boost_row$auc)` |
+
+The logistic regression, written $\hat p^{\mathrm{GLM}}$, has $B_{\mathcal{I}_{\mathrm{test}}}=`r num4(logit_row$brier)`$ and $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}=`r num3(logit_row$auc)`$. The network score stored in `03_neural_network.rds`, written $\hat p^{\mathrm{NN}}$, has $B_{\mathcal{I}_{\mathrm{test}}}=`r num4(nn_row$brier)`$ and $\mathrm{AUC}_{\mathcal{I}_{\mathrm{test}}}=`r num3(nn_row$auc)`$. The linear probability model has $B_{\mathcal{I}_{\mathrm{test}}}=`r num4(lpm_row$brier)`$, with $`r lpm_row$n_outside_01`$ scores outside $[0,1]$.
+
+The bootstrap interval for $\Delta$ resamples $\mathcal{I}_{\mathrm{test}}$ $2000$ times with seed $2028$, inside `01_compare_on_test.R`. The fitted scores stay fixed.
+
+-   $\Delta(\hat p^{\mathrm{tree}},\hat p^{\mathrm{bag}})=`r num4(gap_tree_bag$brier_a_minus_b)`$, interval $`r num4(gap_tree_bag$ci_low)`$ to $`r num4(gap_tree_bag$ci_high)`$.
+-   $\Delta(\hat p^{\mathrm{bag}},\hat p^{\mathrm{rf}})=`r num4(gap_bag_rf$brier_a_minus_b)`$, interval $`r num4(gap_bag_rf$ci_low)`$ to $`r num4(gap_bag_rf$ci_high)`$.
+-   $\Delta(\hat p^{\mathrm{GLM}},\hat p^{\mathrm{rf}})=`r num4(gap_logit_rf$brier_a_minus_b)`$, interval $`r num4(gap_logit_rf$ci_low)`$ to $`r num4(gap_logit_rf$ci_high)`$.
+-   $\Delta(\hat p^{\mathrm{GLM}},\hat p^{\mathrm{boost}})=`r num4(gap_logit_boost$brier_a_minus_b)`$, interval $`r num4(gap_logit_boost$ci_low)`$ to $`r num4(gap_logit_boost$ci_high)`$.
+-   $\Delta(\hat p^{\mathrm{NN}},\hat p^{\mathrm{boost}})=`r num4(gap_nn_boost$brier_a_minus_b)`$, interval $`r num4(gap_nn_boost$ci_low)`$ to $`r num4(gap_nn_boost$ci_high)`$.
+
+$\Delta(m,m')>0$ means $m$ has the larger test Brier score. Because the same $y_i$ enter both scores, $$
+\mathrm{Var}\big(\Delta(m,m')\big)
+=\mathrm{Var}\big(B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{(m)})\big)
++\mathrm{Var}\big(B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{(m')})\big)
+-2\mathrm{Cov}\big(B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{(m)}),B_{\mathcal{I}_{\mathrm{test}}}(\hat p^{(m')})\big).
+$$ An interval for one Brier score and an interval for the other can overlap while the interval for $\Delta$ excludes $0$.
+
+# Reproducing
+
+From the project root, with `churn-decision.Rproj` as the working directory:
+
+``` r
+source("R/trees/00_run_all.R")
+source("R/compare_methods/00_export_linear_logistic.R")
+source("R/compare_methods/01_compare_on_test.R")
+```
+
+The network file `03_neural_network.rds` has to be present already. `00_export_linear_logistic.R` rewrites the linear and logistic files. `01_compare_on_test.R` then loads every `.rds` in `output/test_predictions/`.
+
+| Path | Content |
+|------------------------------------|------------------------------------|
+| `R/trees/tree_lib.R` | Brier score, leaf probability, vote share, boosting probability |
+| `R/trees/01_fit_trees.R` | Cost-complexity search, out-of-bag search for the two forests, boosting search, `save_test_predictions()` |
+| `R/trees/02_assess_trees.R` | Tree drawing, validation paths, importance, calibration, profile, test table |
+| `R/trees/00_run_all.R` | Source the fit and the assessment |
+| `R/compare_methods/01_compare_on_test.R` | Load every saved method and compare them |
+
+Packages to have installed: `rpart`, `rpart.plot`, `randomForest`, `gbm`, `here`, `dplyr`, `ggplot2`, `tidyr`, `pROC`. `rpart` ships with R.
