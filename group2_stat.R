@@ -1,11 +1,11 @@
 install.packages('readr')
 install.packages(c("tidyverse", "caret", "pROC", "car", "broom"), dependencies = TRUE)
 
-library(tidyverse) # Manipulation de données (dplyr) et graphiques (ggplot2)
-library(caret)     # Séparation train/test et matrice de confusion
-library(pROC)      # Courbe ROC et score AUC
-library(car)       # Test de multicolonnalité (VIF)
-library(broom)     # Tableaux de résultats propres (Odds Ratios)
+library(tidyverse) 
+library(caret)     
+library(pROC)      
+library(car)       
+library(broom)     
 library(readr)
 library(pROC)
 
